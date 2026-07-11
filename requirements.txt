@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+psutil
+nvidia-ml-py
+PyYAML

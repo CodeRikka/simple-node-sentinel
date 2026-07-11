@@ -1,0 +1,83 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background: #10151d;
+  color: #e7edf5;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem max(1rem, calc((100% - 1400px) / 2));
+  border-bottom: 1px solid #2a3544;
+  background: #151c26;
+}
+h1 { margin: 0; font-size: 1.35rem; }
+header p { margin: .25rem 0 0; color: #8fa0b5; }
+main { max-width: 1400px; margin: 0 auto; padding: 1rem; }
+section { margin-bottom: 1.75rem; }
+h2 { font-size: 1.05rem; margin: 0 0 .75rem; }
+h3 { margin: 0 0 .75rem; font-size: 1rem; }
+.status {
+  max-width: 45%;
+  overflow: hidden;
+  padding: .35rem .65rem;
+  border-radius: 999px;
+  background: #344050;
+  color: #d6deea;
+  font-size: .82rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status.live { background: #164e3a; color: #a7f3d0; }
+.status.error { background: #601f27; color: #fecaca; }
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: .75rem;
+}
+.card {
+  padding: 1rem;
+  border: 1px solid #2a3544;
+  border-radius: .6rem;
+  background: #18212c;
+}
+.metric {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: .3rem 0;
+  border-top: 1px solid #242f3d;
+  font-size: .88rem;
+}
+.metric .label { color: #93a4b9; }
+.metric strong { text-align: right; overflow-wrap: anywhere; }
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid #2a3544;
+  border-radius: .6rem;
+}
+table { width: 100%; border-collapse: collapse; background: #18212c; font-size: .85rem; }
+th, td { padding: .65rem .75rem; border-bottom: 1px solid #2a3544; text-align: left; white-space: nowrap; }
+th { background: #202a37; color: #aebed0; font-weight: 600; }
+td:last-child { max-width: 40rem; overflow: hidden; text-overflow: ellipsis; }
+tbody tr:last-child td { border-bottom: 0; }
+.empty { color: #8292a6; text-align: center; }
+
+@media (prefers-color-scheme: light) {
+  :root { color-scheme: light; background: #f4f6f8; color: #17202b; }
+  header { background: #fff; border-color: #dbe2ea; }
+  .card, table { background: #fff; }
+  .card, .table-wrap, .metric, th, td { border-color: #dbe2ea; }
+  th { background: #edf1f5; color: #435064; }
+  header p, .metric .label, .empty { color: #64748b; }
+}
+
+@media (max-width: 600px) {
+  header { align-items: flex-start; }
+  .status { max-width: 50%; }
+}

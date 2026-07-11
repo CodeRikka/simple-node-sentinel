@@ -1,0 +1,62 @@
+# Simple Node Sentinel configuration template.
+# Production path: /etc/simple-node-sentinel/config.yaml
+# Leave sensitive or site-specific fields empty, then fill them during install
+# or with: sudoedit /etc/simple-node-sentinel/config.yaml
+
+collection:
+  interval_seconds: 2
+  disk_interval_seconds: 10
+
+database:
+  # Must be an absolute path. DO NOT MODIFY.
+  path: /var/lib/simple-node-sentinel/simple-node-sentinel.db
+  retention_days: 3
+  cleanup_interval_seconds: 3600
+
+alerts:
+  high_temperature_celsius: 85
+  high_duration_seconds: 300
+  recovery_temperature_celsius: 80
+  recovery_duration_seconds: 300
+  # At most one high-temperature email per GPU within this interval.
+  reminder_interval_seconds: 7200
+
+email:
+  # Keep false until SMTP fields below are filled.
+  enabled: false
+  # Examples: smtp.gmail.com  or  smtp.office365.com
+  smtp_host: ""
+  smtp_port: 587
+  use_starttls: true
+  # SMTP login username, often the same as from_address. Example: monitor@example.com
+  username: ""
+  # Absolute path to a file that contains only the SMTP password. DO NOT MODIFY.
+  password_file: /etc/simple-node-sentinel/smtp-password
+  # Envelope From address shown to recipients. Example: monitor@example.com
+  from_address: ""
+  # Administrator recipients for GPU temperature alerts.
+  # Example:
+  #   admin_emails:
+  #     - admin@example.com
+  admin_emails: []
+
+# Map Linux usernames to email addresses. Do not guess addresses.
+# Example:
+#   users:
+#     user1:
+#       email: user1@example.com
+#     user2:
+#       email: user2@example.com
+users: {}
+
+# Notify only listed Linux users when their own GPU process ends.
+# The process must be missing from NVML for missing_duration_seconds.
+# Example:
+#   process_end_notifications:
+#     missing_duration_seconds: 20
+#     users:
+#       - user1
+#       - user2
+process_end_notifications:
+  missing_duration_seconds: 20
+  users: []

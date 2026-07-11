@@ -1,0 +1,27 @@
+[Unit]
+Description=Simple Node Sentinel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/simple-node-sentinel
+ExecStart=/opt/simple-node-sentinel/venv/bin/python -m simple_node_sentinel.main --config /etc/simple-node-sentinel/config.yaml
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/simple-node-sentinel
+ReadOnlyPaths=/etc/simple-node-sentinel
+
+[Install]
+WantedBy=multi-user.target
