@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -102,12 +102,14 @@ class SentinelService:
 
         with self._snapshot_lock:
             disks = self._snapshot["disks"]
+        disk_sampled = False
         if (
             monotonic_now - self._last_disk_sample
             >= self.config.collection.disk_interval_seconds
         ):
             disks = collect_disks()
             self._last_disk_sample = monotonic_now
+            disk_sampled = True
 
         if self.gpu_monitor.initialized and self.gpu_monitor.last_error is None:
             self.database.reconcile_gpu_processes(gpu_processes)
@@ -132,16 +134,23 @@ class SentinelService:
         for gpu in gpus:
             gpu["users"] = sorted(users_by_gpu.get(gpu["uuid"], set()))
 
+        sampled_at = time.time()
         snapshot = {
             "summary": summary,
             "gpus": gpus,
             "gpu_processes": gpu_processes,
             "users": users,
             "disks": disks,
-            "sampled_at": time.time(),
+            "sampled_at": sampled_at,
         }
         with self._snapshot_lock:
             self._snapshot = snapshot
+        self.database.record_metric_snapshot(
+            sampled_at,
+            summary,
+            gpus,
+            disks if disk_sampled else None,
+        )
 
     def snapshot(self, key: str) -> Any:
         with self._snapshot_lock:
@@ -210,6 +219,15 @@ def create_app(config: Config) -> FastAPI:
         return service.alert_manager.overlay_live_values(
             service.database.list_alerts()
         )
+
+    @application.get("/api/history")
+    def history(
+        range_seconds: int = Query(default=3600, ge=60, le=259200),
+        max_points: int = Query(default=720, ge=60, le=1000),
+    ) -> dict[str, Any]:
+        until = time.time()
+        since = until - range_seconds
+        return service.database.query_metric_history(since, until, max_points)
 
     @application.get("/health")
     def health() -> dict[str, Any]:

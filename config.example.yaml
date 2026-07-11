@@ -10,6 +10,7 @@ collection:
 database:
   # Must be an absolute path. DO NOT MODIFY.
   path: /var/lib/simple-node-sentinel/simple-node-sentinel.db
+  # Applies to metric history, completed processes, alerts, and email records.
   retention_days: 3
   cleanup_interval_seconds: 3600
 
@@ -50,13 +51,16 @@ email:
 users: {}
 
 # Notify only listed Linux users when their own GPU process ends.
-# The process must be missing from NVML for missing_duration_seconds.
+# The process must have run for at least min_runtime_seconds, then be
+# missing from NVML for missing_duration_seconds.
 # Example:
 #   process_end_notifications:
+#     min_runtime_seconds: 300
 #     missing_duration_seconds: 20
 #     users:
 #       - user1
 #       - user2
 process_end_notifications:
+  min_runtime_seconds: 300
   missing_duration_seconds: 20
   users: []

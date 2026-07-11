@@ -66,6 +66,51 @@ class Database:
                     ON alerts(recovered_at);
                 CREATE INDEX IF NOT EXISTS idx_email_created
                     ON email_records(created_at);
+                CREATE TABLE IF NOT EXISTS system_metric_samples (
+                    sampled_at REAL PRIMARY KEY,
+                    cpu_usage_percent REAL,
+                    cpu_temperature_celsius REAL,
+                    memory_used_bytes INTEGER,
+                    memory_total_bytes INTEGER,
+                    memory_usage_percent REAL,
+                    swap_used_bytes INTEGER,
+                    swap_total_bytes INTEGER,
+                    swap_usage_percent REAL,
+                    load_1 REAL,
+                    load_5 REAL,
+                    load_15 REAL
+                );
+                CREATE TABLE IF NOT EXISTS gpu_metric_samples (
+                    gpu_uuid TEXT NOT NULL,
+                    sampled_at REAL NOT NULL,
+                    gpu_index INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    utilization_percent REAL,
+                    memory_used_bytes INTEGER,
+                    memory_total_bytes INTEGER,
+                    temperature_celsius REAL,
+                    fan_percent REAL,
+                    power_watts REAL,
+                    power_limit_watts REAL,
+                    PRIMARY KEY(gpu_uuid, sampled_at)
+                );
+                CREATE TABLE IF NOT EXISTS disk_metric_samples (
+                    mountpoint TEXT NOT NULL,
+                    sampled_at REAL NOT NULL,
+                    device TEXT NOT NULL,
+                    filesystem TEXT NOT NULL,
+                    used_bytes INTEGER,
+                    total_bytes INTEGER,
+                    available_bytes INTEGER,
+                    usage_percent REAL,
+                    PRIMARY KEY(mountpoint, sampled_at)
+                );
+                CREATE INDEX IF NOT EXISTS idx_system_metrics_time
+                    ON system_metric_samples(sampled_at);
+                CREATE INDEX IF NOT EXISTS idx_gpu_metrics_time
+                    ON gpu_metric_samples(sampled_at);
+                CREATE INDEX IF NOT EXISTS idx_disk_metrics_time
+                    ON disk_metric_samples(sampled_at);
                 """
             )
             self._connection.commit()
@@ -237,6 +282,212 @@ class Database:
             result.append(item)
         return result
 
+    def record_metric_snapshot(
+        self,
+        sampled_at: float,
+        summary: dict[str, Any],
+        gpus: Iterable[dict[str, Any]],
+        disks: Iterable[dict[str, Any]] | None = None,
+    ) -> None:
+        cpu = summary.get("cpu") or {}
+        temperature = summary.get("cpu_temperature") or {}
+        memory = summary.get("memory") or {}
+        swap = summary.get("swap") or {}
+        load = cpu.get("load_average") or {}
+        gpu_rows = [
+            (
+                str(gpu["uuid"]),
+                sampled_at,
+                int(gpu["index"]),
+                str(gpu.get("name") or "Unknown GPU"),
+                gpu.get("utilization_percent"),
+                gpu.get("memory_used_bytes"),
+                gpu.get("memory_total_bytes"),
+                gpu.get("temperature_celsius"),
+                gpu.get("fan_percent"),
+                gpu.get("power_watts"),
+                gpu.get("power_limit_watts"),
+            )
+            for gpu in gpus
+        ]
+        disk_rows = [
+            (
+                str(disk["mountpoint"]),
+                sampled_at,
+                str(disk.get("device") or ""),
+                str(disk.get("filesystem") or ""),
+                disk.get("used_bytes"),
+                disk.get("total_bytes"),
+                disk.get("available_bytes"),
+                disk.get("usage_percent"),
+            )
+            for disk in (disks or ())
+        ]
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO system_metric_samples (
+                    sampled_at, cpu_usage_percent, cpu_temperature_celsius,
+                    memory_used_bytes, memory_total_bytes, memory_usage_percent,
+                    swap_used_bytes, swap_total_bytes, swap_usage_percent,
+                    load_1, load_5, load_15
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sampled_at,
+                    cpu.get("usage_percent"),
+                    temperature.get("max_celsius"),
+                    memory.get("used_bytes"),
+                    memory.get("total_bytes"),
+                    memory.get("usage_percent"),
+                    swap.get("used_bytes"),
+                    swap.get("total_bytes"),
+                    swap.get("usage_percent"),
+                    load.get("1m"),
+                    load.get("5m"),
+                    load.get("15m"),
+                ),
+            )
+            self.connection.executemany(
+                """
+                INSERT OR REPLACE INTO gpu_metric_samples (
+                    gpu_uuid, sampled_at, gpu_index, name,
+                    utilization_percent, memory_used_bytes, memory_total_bytes,
+                    temperature_celsius, fan_percent, power_watts,
+                    power_limit_watts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                gpu_rows,
+            )
+            self.connection.executemany(
+                """
+                INSERT OR REPLACE INTO disk_metric_samples (
+                    mountpoint, sampled_at, device, filesystem, used_bytes,
+                    total_bytes, available_bytes, usage_percent
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                disk_rows,
+            )
+
+    def query_metric_history(
+        self, since: float, until: float, max_points: int
+    ) -> dict[str, Any]:
+        bucket_seconds = max(1.0, (until - since) / max_points)
+        parameters = (since, bucket_seconds, since, until)
+        with self._lock:
+            system_rows = self.connection.execute(
+                """
+                SELECT
+                    CAST((sampled_at - ?) / ? AS INTEGER) AS bucket,
+                    AVG(sampled_at) AS sampled_at,
+                    AVG(cpu_usage_percent) AS cpu_usage_percent,
+                    MAX(cpu_temperature_celsius) AS cpu_temperature_celsius,
+                    AVG(memory_used_bytes) AS memory_used_bytes,
+                    AVG(memory_total_bytes) AS memory_total_bytes,
+                    AVG(memory_usage_percent) AS memory_usage_percent,
+                    AVG(swap_used_bytes) AS swap_used_bytes,
+                    AVG(swap_total_bytes) AS swap_total_bytes,
+                    AVG(swap_usage_percent) AS swap_usage_percent,
+                    AVG(load_1) AS load_1,
+                    AVG(load_5) AS load_5,
+                    AVG(load_15) AS load_15
+                FROM system_metric_samples
+                WHERE sampled_at >= ? AND sampled_at <= ?
+                GROUP BY bucket ORDER BY bucket
+                """,
+                parameters,
+            ).fetchall()
+            gpu_rows = self.connection.execute(
+                """
+                SELECT
+                    gpu_uuid,
+                    CAST((sampled_at - ?) / ? AS INTEGER) AS bucket,
+                    AVG(sampled_at) AS sampled_at,
+                    MAX(gpu_index) AS gpu_index,
+                    MAX(name) AS name,
+                    AVG(utilization_percent) AS utilization_percent,
+                    AVG(memory_used_bytes) AS memory_used_bytes,
+                    AVG(memory_total_bytes) AS memory_total_bytes,
+                    MAX(temperature_celsius) AS temperature_celsius,
+                    AVG(fan_percent) AS fan_percent,
+                    AVG(power_watts) AS power_watts,
+                    AVG(power_limit_watts) AS power_limit_watts
+                FROM gpu_metric_samples
+                WHERE sampled_at >= ? AND sampled_at <= ?
+                GROUP BY gpu_uuid, bucket ORDER BY gpu_uuid, bucket
+                """,
+                parameters,
+            ).fetchall()
+            disk_rows = self.connection.execute(
+                """
+                WITH latest AS (
+                    SELECT
+                        mountpoint,
+                        CAST((sampled_at - ?) / ? AS INTEGER) AS bucket,
+                        MAX(sampled_at) AS sampled_at
+                    FROM disk_metric_samples
+                    WHERE sampled_at >= ? AND sampled_at <= ?
+                    GROUP BY mountpoint, bucket
+                )
+                SELECT d.*
+                FROM latest l
+                JOIN disk_metric_samples d
+                  ON d.mountpoint = l.mountpoint
+                 AND d.sampled_at = l.sampled_at
+                ORDER BY d.mountpoint, d.sampled_at
+                """,
+                parameters,
+            ).fetchall()
+
+        gpus: dict[str, dict[str, Any]] = {}
+        for row in gpu_rows:
+            item = dict(row)
+            uuid = str(item.pop("gpu_uuid"))
+            item.pop("bucket")
+            device = gpus.setdefault(
+                uuid,
+                {
+                    "uuid": uuid,
+                    "index": item["gpu_index"],
+                    "name": item["name"],
+                    "points": [],
+                },
+            )
+            item.pop("gpu_index")
+            item.pop("name")
+            device["points"].append(item)
+
+        disks: dict[str, dict[str, Any]] = {}
+        for row in disk_rows:
+            item = dict(row)
+            mountpoint = str(item.pop("mountpoint"))
+            device = disks.setdefault(
+                mountpoint,
+                {
+                    "mountpoint": mountpoint,
+                    "device": item["device"],
+                    "filesystem": item["filesystem"],
+                    "points": [],
+                },
+            )
+            item.pop("device")
+            item.pop("filesystem")
+            device["points"].append(item)
+
+        system = []
+        for row in system_rows:
+            item = dict(row)
+            item.pop("bucket")
+            system.append(item)
+        return {
+            "from": since,
+            "to": until,
+            "bucket_seconds": bucket_seconds,
+            "system": system,
+            "gpus": list(gpus.values()),
+            "disks": list(disks.values()),
+        }
+
     def cleanup(self, retention_days: int, now: float | None = None) -> None:
         cutoff = (now if now is not None else time.time()) - retention_days * 86400
         with self._lock, self.connection:
@@ -259,5 +510,17 @@ class Database:
                 DELETE FROM alerts
                 WHERE recovered_at IS NOT NULL AND recovered_at < ?
                 """,
+                (cutoff,),
+            )
+            self.connection.execute(
+                "DELETE FROM system_metric_samples WHERE sampled_at < ?",
+                (cutoff,),
+            )
+            self.connection.execute(
+                "DELETE FROM gpu_metric_samples WHERE sampled_at < ?",
+                (cutoff,),
+            )
+            self.connection.execute(
+                "DELETE FROM disk_metric_samples WHERE sampled_at < ?",
                 (cutoff,),
             )

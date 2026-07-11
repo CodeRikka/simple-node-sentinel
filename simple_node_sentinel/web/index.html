@@ -8,23 +8,53 @@
   </head>
   <body>
     <header>
-      <div>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
         <h1>Simple Node Sentinel</h1>
-        <p>Read-only node status</p>
+          <p>Hardware health and workload overview</p>
+        </div>
       </div>
-      <div id="connection" class="status">Connecting…</div>
+      <div class="header-actions">
+        <label class="range-control">
+          <span>History</span>
+          <select id="history-range">
+            <option value="900">15 minutes</option>
+            <option value="3600" selected>1 hour</option>
+            <option value="21600">6 hours</option>
+            <option value="86400">24 hours</option>
+            <option value="259200">3 days</option>
+          </select>
+        </label>
+        <div id="connection" class="status">Connecting…</div>
+      </div>
     </header>
     <main>
-      <section>
-        <h2>System</h2>
+      <section class="dashboard-section">
+        <div class="section-heading">
+          <div><span class="eyebrow">Host</span><h2>System</h2></div>
+          <p>Processor and memory pressure</p>
+        </div>
         <div id="system-summary" class="cards"></div>
       </section>
-      <section>
-        <h2>GPUs</h2>
-        <div id="gpus" class="cards"></div>
+      <section class="dashboard-section">
+        <div class="section-heading">
+          <div><span class="eyebrow">Accelerators</span><h2>GPUs</h2></div>
+          <p>Utilization, memory, thermals and power</p>
+        </div>
+        <div id="gpus" class="cards gpu-cards"></div>
       </section>
-      <section>
-        <h2>GPU processes</h2>
+      <section class="dashboard-section">
+        <div class="section-heading">
+          <div><span class="eyebrow">Storage</span><h2>Disks</h2></div>
+          <p>Capacity across physical mounts</p>
+        </div>
+        <div id="disks" class="cards disk-cards"></div>
+      </section>
+      <section class="detail-section">
+        <div class="section-heading">
+          <div><span class="eyebrow">Workloads</span><h2>GPU processes</h2></div>
+        </div>
         <div class="table-wrap">
           <table id="gpu-processes">
             <thead><tr><th>GPU</th><th>User</th><th>PID</th><th>GPU memory</th><th>CPU</th><th>RAM</th><th>Runtime</th><th>Command</th></tr></thead>
@@ -32,8 +62,10 @@
           </table>
         </div>
       </section>
-      <section>
-        <h2>Users</h2>
+      <section class="detail-section">
+        <div class="section-heading">
+          <div><span class="eyebrow">Allocation</span><h2>Users</h2></div>
+        </div>
         <div class="table-wrap">
           <table id="users">
             <thead><tr><th>User</th><th>Processes</th><th>CPU</th><th>RAM</th><th>GPU processes</th><th>GPU memory</th></tr></thead>
@@ -41,17 +73,10 @@
           </table>
         </div>
       </section>
-      <section>
-        <h2>Disks</h2>
-        <div class="table-wrap">
-          <table id="disks">
-            <thead><tr><th>Device</th><th>Mount</th><th>Filesystem</th><th>Total</th><th>Used</th><th>Available</th><th>Usage</th></tr></thead>
-            <tbody></tbody>
-          </table>
+      <section class="detail-section">
+        <div class="section-heading">
+          <div><span class="eyebrow">Events</span><h2>Temperature alerts</h2></div>
         </div>
-      </section>
-      <section>
-        <h2>Temperature alerts</h2>
         <div class="table-wrap">
           <table id="alerts">
             <thead><tr><th>GPU</th><th>Triggered</th><th>Status</th><th>Current</th><th>Maximum</th><th>Users</th><th>Email</th></tr></thead>
@@ -60,6 +85,7 @@
         </div>
       </section>
     </main>
+    <script src="/static/chart.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

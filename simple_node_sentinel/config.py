@@ -50,6 +50,7 @@ class UserConfig:
 class ProcessEndNotificationConfig:
     users: tuple[str, ...] = ()
     missing_duration_seconds: float = 20.0
+    min_runtime_seconds: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,10 @@ def validate_config(config: Config) -> None:
     _positive(
         config.process_end_notifications.missing_duration_seconds,
         "process_end_notifications.missing_duration_seconds",
+    )
+    _positive(
+        config.process_end_notifications.min_runtime_seconds,
+        "process_end_notifications.min_runtime_seconds",
     )
     if (
         config.alerts.recovery_temperature_celsius

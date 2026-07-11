@@ -89,6 +89,106 @@ class ConfigTests(unittest.TestCase):
 
 
 class DatabaseTests(unittest.TestCase):
+    def test_metric_history_is_grouped_and_preserves_temperature_peaks(self) -> None:
+        database = Database(":memory:")
+        database.open()
+        try:
+            for sampled_at, usage, temperature in (
+                (100.0, 10.0, 70.0),
+                (102.0, 30.0, 90.0),
+            ):
+                database.record_metric_snapshot(
+                    sampled_at,
+                    {
+                        "cpu": {
+                            "usage_percent": usage,
+                            "load_average": {"1m": 1, "5m": 2, "15m": 3},
+                        },
+                        "cpu_temperature": {"max_celsius": temperature},
+                        "memory": {
+                            "used_bytes": 50,
+                            "total_bytes": 100,
+                            "usage_percent": 50,
+                        },
+                        "swap": {
+                            "used_bytes": None,
+                            "total_bytes": None,
+                            "usage_percent": None,
+                        },
+                    },
+                    [
+                        {
+                            "uuid": "GPU-1",
+                            "index": 0,
+                            "name": "Test GPU",
+                            "utilization_percent": usage,
+                            "memory_used_bytes": 25,
+                            "memory_total_bytes": 100,
+                            "temperature_celsius": temperature,
+                            "fan_percent": None,
+                            "power_watts": 100,
+                            "power_limit_watts": 200,
+                        },
+                        {
+                            "uuid": "GPU-2",
+                            "index": 1,
+                            "name": "Second GPU",
+                            "utilization_percent": None,
+                        },
+                    ],
+                    [
+                        {
+                            "mountpoint": "/",
+                            "device": "/dev/sda1",
+                            "filesystem": "ext4",
+                            "used_bytes": 40 + usage,
+                            "total_bytes": 100,
+                            "available_bytes": 60 - usage,
+                            "usage_percent": 40 + usage,
+                        }
+                    ],
+                )
+
+            history = database.query_metric_history(100, 103, max_points=1)
+            self.assertEqual(len(history["system"]), 1)
+            self.assertEqual(history["system"][0]["cpu_usage_percent"], 20)
+            self.assertEqual(history["system"][0]["cpu_temperature_celsius"], 90)
+            self.assertIsNone(history["system"][0]["swap_usage_percent"])
+            self.assertEqual(
+                {gpu["uuid"] for gpu in history["gpus"]},
+                {"GPU-1", "GPU-2"},
+            )
+            self.assertEqual(
+                next(
+                    gpu for gpu in history["gpus"] if gpu["uuid"] == "GPU-1"
+                )["points"][0]["temperature_celsius"],
+                90,
+            )
+            self.assertEqual(history["disks"][0]["points"][0]["sampled_at"], 102)
+            self.assertEqual(history["disks"][0]["points"][0]["usage_percent"], 70)
+        finally:
+            database.close()
+
+    def test_metric_samples_follow_retention(self) -> None:
+        database = Database(":memory:")
+        database.open()
+        try:
+            summary = {
+                "cpu": {},
+                "cpu_temperature": {},
+                "memory": {},
+                "swap": {},
+            }
+            database.record_metric_snapshot(100, summary, [], [])
+            database.record_metric_snapshot(400000, summary, [], [])
+            database.cleanup(retention_days=3, now=400001)
+            rows = database.connection.execute(
+                "SELECT sampled_at FROM system_metric_samples ORDER BY sampled_at"
+            ).fetchall()
+            self.assertEqual([row["sampled_at"] for row in rows], [400000])
+        finally:
+            database.close()
+
     def test_process_lifecycle_and_retention(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(str(Path(directory) / "test.db"))
@@ -217,7 +317,54 @@ class ProcessEndNotificationTests(unittest.TestCase):
             )
             manager = ProcessEndManager(
                 ProcessEndNotificationConfig(
-                    users=("alice",), missing_duration_seconds=20
+                    users=("alice",),
+                    missing_duration_seconds=20,
+                    min_runtime_seconds=300,
+                ),
+                sender,
+                database,
+            )
+            process = {
+                "gpu_uuid": "GPU-1",
+                "gpu_index": 0,
+                "pid": 123,
+                "started_at": 100.0,
+                "username": "alice",
+                "executable": "python",
+                "command": "python train.py",
+            }
+            manager.evaluate([process], monotonic_now=0, wall_now=400)
+            manager.evaluate([], monotonic_now=1, wall_now=401)
+            manager.evaluate([], monotonic_now=20, wall_now=420)
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM email_records"
+                ).fetchone()[0],
+                0,
+            )
+            manager.evaluate([], monotonic_now=21, wall_now=421)
+            row = database.connection.execute(
+                "SELECT kind, recipients_json, status FROM email_records"
+            ).fetchone()
+            self.assertEqual(row["kind"], "process_end")
+            self.assertEqual(row["recipients_json"], '["alice@example.com"]')
+            self.assertEqual(row["status"], "disabled")
+        finally:
+            database.close()
+
+    def test_short_lived_process_is_not_notified(self) -> None:
+        database = Database(":memory:")
+        database.open()
+        try:
+            sender = EmailSender(
+                EmailConfig(enabled=False),
+                {"alice": UserConfig(email="alice@example.com")},
+            )
+            manager = ProcessEndManager(
+                ProcessEndNotificationConfig(
+                    users=("alice",),
+                    missing_duration_seconds=20,
+                    min_runtime_seconds=300,
                 ),
                 sender,
                 database,
@@ -233,20 +380,14 @@ class ProcessEndNotificationTests(unittest.TestCase):
             }
             manager.evaluate([process], monotonic_now=0, wall_now=100)
             manager.evaluate([], monotonic_now=1, wall_now=101)
-            manager.evaluate([], monotonic_now=20, wall_now=120)
+            manager.evaluate([], monotonic_now=21, wall_now=121)
             self.assertEqual(
                 database.connection.execute(
                     "SELECT COUNT(*) FROM email_records"
                 ).fetchone()[0],
                 0,
             )
-            manager.evaluate([], monotonic_now=21, wall_now=121)
-            row = database.connection.execute(
-                "SELECT kind, recipients_json, status FROM email_records"
-            ).fetchone()
-            self.assertEqual(row["kind"], "process_end")
-            self.assertEqual(row["recipients_json"], '["alice@example.com"]')
-            self.assertEqual(row["status"], "disabled")
+            self.assertEqual(manager.tracked, {})
         finally:
             database.close()
 
@@ -278,6 +419,7 @@ class DiskAndApiTests(unittest.TestCase):
             "/api/users",
             "/api/disks",
             "/api/alerts",
+            "/api/history",
             "/health",
         }
         route_methods = {
@@ -288,6 +430,25 @@ class DiskAndApiTests(unittest.TestCase):
         self.assertEqual(set(route_methods), monitored_paths)
         for methods in route_methods.values():
             self.assertEqual(methods, {"GET"})
+
+        history_route = next(
+            route for route in app.routes if getattr(route, "path", None) == "/api/history"
+        )
+        query_parameters = {
+            parameter.name: parameter.field_info
+            for parameter in history_route.dependant.query_params
+        }
+        constraints = {
+            name: {
+                type(item).__name__: getattr(
+                    item, type(item).__name__.lower()
+                )
+                for item in field_info.metadata
+            }
+            for name, field_info in query_parameters.items()
+        }
+        self.assertEqual(constraints["range_seconds"], {"Ge": 60, "Le": 259200})
+        self.assertEqual(constraints["max_points"], {"Ge": 60, "Le": 1000})
 
     def test_application_lifecycle_uses_temporary_database(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

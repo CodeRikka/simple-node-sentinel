@@ -15,8 +15,10 @@ from users.
 - Per-user process, CPU, RAM and GPU totals
 - Sustained GPU temperature alerts and optional SMTP delivery
 
-Real-time metrics stay in memory. SQLite stores only GPU process lifetimes,
-temperature alert events and email delivery records.
+The latest snapshot stays in memory for fast live updates. SQLite also stores
+system, GPU and disk metric history, GPU process lifetimes, temperature alert
+events and email delivery records. Metric history is retained for three days by
+default and is downsampled by the API before it reaches the browser.
 
 ## Requirements
 
@@ -69,15 +71,22 @@ sudo systemctl status simple-node-sentinel.service
 sudo journalctl -u simple-node-sentinel.service -f
 ```
 
+`database.retention_days` applies to metric history as well as completed event
+records. At the default two-second collection interval, multi-GPU nodes can use
+several hundred MiB for three days of history; monitor the database file when
+choosing a longer retention period.
+
 Temperature alerts are sent after five continuous minutes above the configured
 threshold, with at most one alert per GPU every two hours. Recovery is recorded
 after five continuous minutes below the recovery threshold, but no recovery
 email is sent and the two-hour cooldown is preserved.
 
 To notify selected users when one of their GPU processes ends, list their Linux
-usernames under `process_end_notifications.users`. A process must be absent
-from NVML for 20 continuous seconds before the user is emailed. These
-notifications go only to the affected user, not to administrators.
+usernames under `process_end_notifications.users`. The process must have run
+for at least `min_runtime_seconds` (default five minutes), then be absent from
+NVML for `missing_duration_seconds` (default 20 seconds) before the user is
+emailed. Short-lived processes are ignored. These notifications go only to the
+affected user, not to administrators.
 
 ## Production installation
 
@@ -151,6 +160,11 @@ ssh -p 2255 -N -L 127.0.0.1:18080:127.0.0.1:8080 username@server
 
 Open `http://127.0.0.1:18080`.
 
+The dashboard refreshes current values every two seconds. CPU, memory, swap,
+GPU and disk cards include historical curves with 15-minute, 1-hour, 6-hour,
+24-hour and 3-day ranges. Charts are served locally and do not require internet
+access.
+
 ## Read-only API
 
 - `GET /api/summary`
@@ -159,9 +173,11 @@ Open `http://127.0.0.1:18080`.
 - `GET /api/users`
 - `GET /api/disks`
 - `GET /api/alerts`
+- `GET /api/history?range_seconds=3600&max_points=720`
 - `GET /health`
 
-There are no POST or control endpoints.
+The history endpoint accepts 60–259200 seconds and returns at most 1000
+downsampled points per series. There are no POST or control endpoints.
 
 ## Tests
 

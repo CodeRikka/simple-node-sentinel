@@ -71,6 +71,10 @@ class ProcessEndManager:
                 continue
             if now - tracked.missing_since < self.config.missing_duration_seconds:
                 continue
+            runtime = wall - float(tracked.details["started_at"])
+            if runtime < self.config.min_runtime_seconds:
+                del self.tracked[key]
+                continue
             self._notify(tracked.details, wall)
             self.notified[key] = now
             del self.tracked[key]

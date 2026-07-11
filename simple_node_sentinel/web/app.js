@@ -1,6 +1,19 @@
 "use strict";
 
 const $ = (selector) => document.querySelector(selector);
+const metricNodes = new Map();
+const charts = new Map();
+let gpuSignature = null;
+let diskSignature = null;
+let historyData = null;
+
+const COLORS = {
+  cyan: "#22d3ee",
+  violet: "#a78bfa",
+  emerald: "#34d399",
+  amber: "#fbbf24",
+  rose: "#fb7185",
+};
 
 function formatBytes(value) {
   if (value === null || value === undefined) return "N/A";
@@ -44,22 +57,233 @@ function textElement(tag, className, text) {
   return element;
 }
 
-function card(title, rows) {
+function series(key, label, color, format = formatPercent, value = null) {
+  return {
+    key,
+    label,
+    color,
+    format,
+    value,
+    normalize: (raw) => raw,
+  };
+}
+
+function createMetricCard(key, title, subtitle, rows, chartDefinitions) {
   const element = textElement("article", "card", "");
-  element.appendChild(textElement("h3", "", title));
-  for (const [label, value] of rows) {
-    const row = textElement("div", "metric", "");
-    row.appendChild(textElement("span", "label", label));
-    row.appendChild(textElement("strong", "", value));
-    element.appendChild(row);
+  const heading = textElement("div", "card-heading", "");
+  const headingText = textElement("div", "", "");
+  headingText.append(
+    textElement("h3", "", title),
+    textElement("p", "card-subtitle", subtitle),
+  );
+  heading.appendChild(headingText);
+  element.appendChild(heading);
+
+  const primary = rows.find((row) => row.primary);
+  if (primary) {
+    const value = textElement("strong", "primary-value", "N/A");
+    metricNodes.set(`${key}:${primary.id}`, value);
+    element.appendChild(value);
   }
+
+  const metrics = textElement("div", "metric-grid", "");
+  rows.filter((row) => !row.primary).forEach((item) => {
+    const row = textElement("div", "metric", "");
+    row.appendChild(textElement("span", "label", item.label));
+    const value = textElement("strong", "", "N/A");
+    metricNodes.set(`${key}:${item.id}`, value);
+    row.appendChild(value);
+    metrics.appendChild(row);
+  });
+  element.appendChild(metrics);
+
+  chartDefinitions.forEach((definition) => {
+    const block = textElement("div", "chart-block", "");
+    if (definition.title) block.appendChild(textElement("span", "chart-title", definition.title));
+    const holder = textElement("div", "chart", "");
+    block.appendChild(holder);
+    element.appendChild(block);
+    charts.set(
+      `${key}:${definition.id}`,
+      new window.TimeSeriesChart(holder, {
+        title: `${title} ${definition.title || "history"}`,
+        series: definition.series,
+      }),
+    );
+  });
   return element;
 }
 
-function replaceCards(selector, cards) {
-  const container = $(selector);
-  container.replaceChildren(...cards);
-  if (!cards.length) container.appendChild(textElement("p", "empty", "No data available"));
+function setMetric(cardKey, id, value) {
+  const node = metricNodes.get(`${cardKey}:${id}`);
+  if (node) node.textContent = value;
+}
+
+function clearCards(prefix) {
+  for (const key of [...metricNodes.keys()]) {
+    if (key.startsWith(`${prefix}:`)) metricNodes.delete(key);
+  }
+  for (const key of [...charts.keys()]) {
+    if (key.startsWith(`${prefix}:`)) charts.delete(key);
+  }
+}
+
+function setupSystemCards() {
+  if (charts.has("system-cpu:history")) return;
+  $("#system-summary").replaceChildren(
+    createMetricCard("system-cpu", "CPU", "Aggregate processor activity", [
+      { id: "usage", primary: true },
+      { id: "temperature", label: "Maximum temperature" },
+      { id: "cores", label: "Logical cores" },
+      { id: "load", label: "Load 1 / 5 / 15" },
+      { id: "uptime", label: "Uptime" },
+    ], [{
+      id: "history",
+      title: "Usage and temperature",
+      series: [
+        series("cpu_usage_percent", "Usage", COLORS.cyan),
+        series("cpu_temperature_celsius", "Temperature", COLORS.rose, formatTemperature),
+      ],
+    }]),
+    createMetricCard("system-memory", "Memory", "Physical memory pressure", [
+      { id: "usage", primary: true },
+      { id: "used", label: "Used" },
+      { id: "available", label: "Available" },
+    ], [{
+      id: "history",
+      title: "Usage",
+      series: [series("memory_usage_percent", "Memory", COLORS.violet)],
+    }]),
+    createMetricCard("system-swap", "Swap", "Overflow memory activity", [
+      { id: "usage", primary: true },
+      { id: "used", label: "Used" },
+      { id: "sampled", label: "Last sample" },
+    ], [{
+      id: "history",
+      title: "Usage",
+      series: [series("swap_usage_percent", "Swap", COLORS.amber)],
+    }]),
+  );
+}
+
+function renderSystem(data) {
+  setupSystemCards();
+  const cpu = data.cpu || {};
+  const temperature = data.cpu_temperature || {};
+  const memory = data.memory || {};
+  const swap = data.swap || {};
+  const load = cpu.load_average || {};
+  setMetric("system-cpu", "usage", formatPercent(cpu.usage_percent));
+  setMetric("system-cpu", "temperature", formatTemperature(temperature.max_celsius));
+  setMetric("system-cpu", "cores", cpu.logical_count ?? "N/A");
+  setMetric("system-cpu", "load", [load["1m"], load["5m"], load["15m"]]
+    .map((value) => value == null ? "N/A" : Number(value).toFixed(2)).join(" / "));
+  setMetric("system-cpu", "uptime", cpu.boot_time
+    ? formatDuration(Date.now() / 1000 - cpu.boot_time) : "N/A");
+  setMetric("system-memory", "usage", formatPercent(memory.usage_percent));
+  setMetric("system-memory", "used",
+    `${formatBytes(memory.used_bytes)} / ${formatBytes(memory.total_bytes)}`);
+  setMetric("system-memory", "available", formatBytes(memory.available_bytes));
+  setMetric("system-swap", "usage", formatPercent(swap.usage_percent));
+  setMetric("system-swap", "used",
+    `${formatBytes(swap.used_bytes)} / ${formatBytes(swap.total_bytes)}`);
+  setMetric("system-swap", "sampled", data.sampled_at
+    ? new Date(data.sampled_at * 1000).toLocaleTimeString() : "Waiting");
+}
+
+function renderGpus(gpus) {
+  const signature = gpus.map((gpu) => gpu.uuid).sort().join("|");
+  if (signature !== gpuSignature) {
+    clearCards("gpu");
+    const cards = gpus.map((gpu) => createMetricCard(
+      `gpu:${gpu.uuid}`,
+      `GPU ${gpu.index}`,
+      gpu.name,
+      [
+        { id: "utilization", primary: true },
+        { id: "temperature", label: "Temperature" },
+        { id: "memory", label: "Memory" },
+        { id: "fan", label: "Fan" },
+        { id: "power", label: "Power" },
+        { id: "workloads", label: "Workloads" },
+      ],
+      [
+        {
+          id: "load",
+          title: "Compute and memory load",
+          series: [
+            series("utilization_percent", "GPU", COLORS.cyan),
+            series("memory_used_bytes", "VRAM", COLORS.violet, formatPercent,
+              (point) => point.memory_total_bytes
+                ? point.memory_used_bytes / point.memory_total_bytes * 100 : null),
+          ],
+        },
+        {
+          id: "thermal",
+          title: "Thermals and power",
+          series: [
+            series("temperature_celsius", "Temperature", COLORS.rose, formatTemperature),
+            series("power_watts", "Power", COLORS.amber, formatPercent,
+              (point) => point.power_limit_watts
+                ? point.power_watts / point.power_limit_watts * 100 : null),
+          ],
+        },
+      ],
+    ));
+    $("#gpus").replaceChildren(...cards);
+    if (!cards.length) $("#gpus").appendChild(
+      textElement("p", "empty panel-empty", "No NVIDIA GPU data available"),
+    );
+    gpuSignature = signature;
+  }
+  gpus.forEach((gpu) => {
+    const key = `gpu:${gpu.uuid}`;
+    setMetric(key, "utilization", formatPercent(gpu.utilization_percent));
+    setMetric(key, "temperature", formatTemperature(gpu.temperature_celsius));
+    setMetric(key, "memory",
+      `${formatBytes(gpu.memory_used_bytes)} / ${formatBytes(gpu.memory_total_bytes)}`);
+    setMetric(key, "fan", formatPercent(gpu.fan_percent));
+    setMetric(key, "power", gpu.power_watts == null ? "N/A"
+      : `${gpu.power_watts.toFixed(1)} / ${gpu.power_limit_watts?.toFixed(1) ?? "N/A"} W`);
+    setMetric(key, "workloads",
+      `${gpu.process_count} process${gpu.process_count === 1 ? "" : "es"} · `
+      + ((gpu.users || []).join(", ") || "No users"));
+  });
+}
+
+function renderDisks(disks) {
+  const signature = disks.map((disk) => disk.mountpoint).sort().join("|");
+  if (signature !== diskSignature) {
+    clearCards("disk");
+    const cards = disks.map((disk) => createMetricCard(
+      `disk:${disk.mountpoint}`,
+      disk.mountpoint,
+      `${disk.device} · ${disk.filesystem}`,
+      [
+        { id: "usage", primary: true },
+        { id: "used", label: "Used" },
+        { id: "available", label: "Available" },
+        { id: "total", label: "Capacity" },
+      ],
+      [{
+        id: "history",
+        title: "Space used",
+        series: [series("usage_percent", "Usage", COLORS.emerald)],
+      }],
+    ));
+    $("#disks").replaceChildren(...cards);
+    if (!cards.length) $("#disks").appendChild(
+      textElement("p", "empty panel-empty", "No physical disk data available"),
+    );
+    diskSignature = signature;
+  }
+  disks.forEach((disk) => {
+    const key = `disk:${disk.mountpoint}`;
+    setMetric(key, "usage", formatPercent(disk.usage_percent));
+    setMetric(key, "used", formatBytes(disk.used_bytes));
+    setMetric(key, "available", formatBytes(disk.available_bytes));
+    setMetric(key, "total", formatBytes(disk.total_bytes));
+  });
 }
 
 function replaceRows(selector, rows) {
@@ -73,11 +297,26 @@ function replaceRows(selector, rows) {
     body.appendChild(row);
     return;
   }
-  for (const values of rows) {
+  rows.forEach((values) => {
     const row = document.createElement("tr");
-    for (const value of values) row.appendChild(textElement("td", "", String(value)));
+    values.forEach((value) => row.appendChild(textElement("td", "", String(value))));
     body.appendChild(row);
-  }
+  });
+}
+
+function updateHistoryCharts() {
+  if (!historyData) return;
+  const system = historyData.system || [];
+  charts.get("system-cpu:history")?.update(system);
+  charts.get("system-memory:history")?.update(system);
+  charts.get("system-swap:history")?.update(system);
+  (historyData.gpus || []).forEach((gpu) => {
+    charts.get(`gpu:${gpu.uuid}:load`)?.update(gpu.points || []);
+    charts.get(`gpu:${gpu.uuid}:thermal`)?.update(gpu.points || []);
+  });
+  (historyData.disks || []).forEach((disk) => {
+    charts.get(`disk:${disk.mountpoint}:history`)?.update(disk.points || []);
+  });
 }
 
 async function request(path) {
@@ -86,82 +325,54 @@ async function request(path) {
   return response.json();
 }
 
-function renderSystem(data) {
-  const cpu = data.cpu || {};
-  const temperature = data.cpu_temperature || {};
-  const memory = data.memory || {};
-  const swap = data.swap || {};
-  const load = cpu.load_average || {};
-  replaceCards("#system-summary", [
-    card("CPU", [
-      ["Usage", formatPercent(cpu.usage_percent)],
-      ["Maximum temperature", formatTemperature(temperature.max_celsius)],
-      ["Logical cores", cpu.logical_count ?? "N/A"],
-      ["Load 1 / 5 / 15", [load["1m"], load["5m"], load["15m"]].map((v) => v == null ? "N/A" : Number(v).toFixed(2)).join(" / ")],
-      ["Uptime", cpu.boot_time ? formatDuration(Date.now() / 1000 - cpu.boot_time) : "N/A"],
-    ]),
-    card("Memory", [
-      ["Used", `${formatBytes(memory.used_bytes)} / ${formatBytes(memory.total_bytes)}`],
-      ["Available", formatBytes(memory.available_bytes)],
-      ["Usage", formatPercent(memory.usage_percent)],
-    ]),
-    card("Swap", [
-      ["Used", `${formatBytes(swap.used_bytes)} / ${formatBytes(swap.total_bytes)}`],
-      ["Usage", formatPercent(swap.usage_percent)],
-      ["Sampled", data.sampled_at ? new Date(data.sampled_at * 1000).toLocaleString() : "Waiting"],
-    ]),
-  ]);
-}
-
-function renderGpus(gpus) {
-  replaceCards("#gpus", gpus.map((gpu) => card(`GPU ${gpu.index}: ${gpu.name}`, [
-    ["Temperature", formatTemperature(gpu.temperature_celsius)],
-    ["Utilization", formatPercent(gpu.utilization_percent)],
-    ["Memory", `${formatBytes(gpu.memory_used_bytes)} / ${formatBytes(gpu.memory_total_bytes)}`],
-    ["Fan", formatPercent(gpu.fan_percent)],
-    ["Power", gpu.power_watts == null ? "N/A" : `${gpu.power_watts.toFixed(1)} / ${gpu.power_limit_watts?.toFixed(1) ?? "N/A"} W`],
-    ["Processes", String(gpu.process_count)],
-    ["Users", (gpu.users || []).join(", ") || "None"],
-  ])));
-}
-
-async function refresh() {
+async function refreshLive() {
   const [summary, gpus, processes, users, disks, alerts] = await Promise.all([
     request("/api/summary"), request("/api/gpus"), request("/api/gpu-processes"),
     request("/api/users"), request("/api/disks"), request("/api/alerts"),
   ]);
   renderSystem(summary);
   renderGpus(gpus);
-  replaceRows("#gpu-processes", processes.map((p) => [
-    p.gpu_index, p.username, p.pid, formatBytes(p.gpu_memory_bytes),
-    formatPercent(p.cpu_percent), formatBytes(p.memory_rss_bytes),
-    formatDuration(p.runtime_seconds), p.command || p.executable,
+  renderDisks(disks);
+  replaceRows("#gpu-processes", processes.map((process) => [
+    process.gpu_index, process.username, process.pid, formatBytes(process.gpu_memory_bytes),
+    formatPercent(process.cpu_percent), formatBytes(process.memory_rss_bytes),
+    formatDuration(process.runtime_seconds), process.command || process.executable,
   ]));
-  replaceRows("#users", users.map((u) => [
-    u.username, u.process_count, formatPercent(u.cpu_percent),
-    formatBytes(u.memory_rss_bytes), u.gpu_process_count, formatBytes(u.gpu_memory_bytes),
+  replaceRows("#users", users.map((user) => [
+    user.username, user.process_count, formatPercent(user.cpu_percent),
+    formatBytes(user.memory_rss_bytes), user.gpu_process_count, formatBytes(user.gpu_memory_bytes),
   ]));
-  replaceRows("#disks", disks.map((d) => [
-    d.device, d.mountpoint, d.filesystem, formatBytes(d.total_bytes),
-    formatBytes(d.used_bytes), formatBytes(d.available_bytes), formatPercent(d.usage_percent),
+  replaceRows("#alerts", alerts.map((alert) => [
+    alert.gpu_index, new Date(alert.triggered_at * 1000).toLocaleString(), alert.status,
+    formatTemperature(alert.current_temperature), formatTemperature(alert.max_temperature),
+    (alert.users || []).join(", ") || "None", alert.email_status || "not attempted",
   ]));
-  replaceRows("#alerts", alerts.map((a) => [
-    a.gpu_index, new Date(a.triggered_at * 1000).toLocaleString(), a.status,
-    formatTemperature(a.current_temperature), formatTemperature(a.max_temperature),
-    (a.users || []).join(", ") || "None", a.email_status || "not attempted",
-  ]));
+  updateHistoryCharts();
   $("#connection").textContent = "Live";
   $("#connection").className = "status live";
 }
 
-async function update() {
+async function updateLive() {
   try {
-    await refresh();
+    await refreshLive();
   } catch (error) {
     $("#connection").textContent = `Unavailable: ${error.message}`;
     $("#connection").className = "status error";
   }
 }
 
-update();
-setInterval(update, 2000);
+async function refreshHistory() {
+  try {
+    const range = Number($("#history-range").value);
+    historyData = await request(`/api/history?range_seconds=${range}&max_points=720`);
+    updateHistoryCharts();
+  } catch (error) {
+    console.error("Unable to refresh metric history", error);
+  }
+}
+
+$("#history-range").addEventListener("change", refreshHistory);
+updateLive();
+refreshHistory();
+setInterval(updateLive, 2000);
+setInterval(refreshHistory, 30000);
