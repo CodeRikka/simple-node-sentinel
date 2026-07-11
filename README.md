@@ -59,6 +59,16 @@ The password file must contain only the SMTP password or app password, with no
 quotes. User email addresses are never guessed; add explicit entries under
 `users`. Users without mappings are named in the administrator notification.
 
+Configuration is read at process start. After editing `config.yaml` or the
+SMTP password file, restart the service (no need to rerun `install.sh`):
+
+```bash
+sudoedit /etc/simple-node-sentinel/config.yaml
+sudo systemctl restart simple-node-sentinel.service
+sudo systemctl status simple-node-sentinel.service
+sudo journalctl -u simple-node-sentinel.service -f
+```
+
 Temperature alerts are sent after five continuous minutes above the configured
 threshold, with at most one alert per GPU every two hours. Recovery is recorded
 after five continuous minutes below the recovery threshold, but no recovery
