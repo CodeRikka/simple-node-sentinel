@@ -50,6 +50,20 @@ h3 { margin: 0; font-size: 1rem; }
   margin-bottom: .85rem;
 }
 .section-heading > p { margin: 0; color: #71839a; font-size: .8rem; }
+.section-actions { display: flex; align-items: center; gap: .75rem; }
+.section-actions > p { margin: 0; color: #71839a; font-size: .8rem; }
+.small-button {
+  border: 1px solid #2a465c;
+  border-radius: 999px;
+  padding: .4rem .72rem;
+  background: #102333;
+  color: #8de7f7;
+  font: inherit;
+  font-size: .72rem;
+  cursor: pointer;
+}
+.small-button:hover { border-color: #3d7895; background: #153047; }
+.small-button:focus-visible { outline: 2px solid #22d3ee; outline-offset: 2px; }
 .status {
   max-width: 18rem;
   overflow: hidden;
@@ -80,6 +94,50 @@ select {
 }
 .gpu-cards { grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); }
 .disk-cards { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.physical-disk-card { min-width: 0; }
+.physical-disk-overview {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem 0 .8rem;
+}
+.disk-pie {
+  --disk-usage: 0deg;
+  display: grid;
+  flex: 0 0 108px;
+  width: 108px;
+  height: 108px;
+  place-items: center;
+  border-radius: 50%;
+  background: conic-gradient(#34d399 var(--disk-usage), #243142 0);
+  position: relative;
+}
+.disk-pie::after {
+  content: "";
+  position: absolute;
+  inset: 13px;
+  border-radius: 50%;
+  background: #0f1925;
+}
+.disk-pie strong { position: relative; z-index: 1; font-size: 1rem; }
+.physical-disk-details {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: .38rem .75rem;
+  font-size: .75rem;
+}
+.physical-disk-details .label { color: #8293a8; }
+.physical-disk-details strong { text-align: right; overflow-wrap: anywhere; }
+.physical-mounts { padding-top: .7rem; border-top: 1px solid #1d2937; }
+.physical-mount {
+  display: flex;
+  justify-content: space-between;
+  gap: .75rem;
+  padding: .38rem 0;
+  color: #a8b5c5;
+  font-size: .74rem;
+}
 .card {
   min-width: 0;
   padding: 1rem;
@@ -150,8 +208,11 @@ tbody tr:hover { background: rgba(42, 57, 76, .25); }
   :root { color-scheme: light; background: #f4f7fa; color: #17202b; }
   header { background: rgba(255, 255, 255, .94); border-color: #dbe2ea; }
   select { background: #fff; color: #17202b; border-color: #ccd6e1; }
+  .small-button { background: #eef8fb; color: #14647b; border-color: #b7dce7; }
   .card { background: linear-gradient(145deg, #fff, #f8fafc); box-shadow: 0 10px 30px rgba(38, 58, 80, .07); }
-  .card, .table-wrap, .metric, .chart-block, th, td { border-color: #dbe2ea; }
+  .card, .table-wrap, .metric, .chart-block, .physical-mounts, th, td { border-color: #dbe2ea; }
+  .disk-pie { background: conic-gradient(#059669 var(--disk-usage), #dce4ed 0); }
+  .disk-pie::after { background: #fff; }
   .table-wrap { background: #fff; }
   th { background: #edf2f7; color: #435064; }
   header p, .metric .label, .empty, .card-subtitle, .section-heading > p { color: #64748b; }
@@ -164,7 +225,8 @@ tbody tr:hover { background: rgba(42, 57, 76, .25); }
   .header-actions { align-items: flex-end; flex-direction: column-reverse; }
   .status { max-width: 11rem; }
   .brand-mark { display: none; }
-  .brand p, .range-control > span, .section-heading > p { display: none; }
+  .brand p, .range-control > span, .section-heading > p, .section-actions > p { display: none; }
+  .section-actions { margin-left: auto; }
   .cards, .gpu-cards, .disk-cards { grid-template-columns: minmax(0, 1fr); }
   .metric-grid { grid-template-columns: minmax(0, 1fr); }
   main { padding-top: 1rem; }

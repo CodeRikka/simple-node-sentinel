@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import psutil
@@ -28,6 +29,64 @@ VIRTUAL_FILESYSTEMS = {
     "fusectl",
     "configfs",
 }
+
+
+def _read_sysfs_value(path: Path) -> str | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
+
+
+def _physical_block_names(device: str) -> list[str]:
+    try:
+        block_name = Path(device).resolve().name
+    except OSError:
+        block_name = Path(device).name
+    block_path = Path("/sys/class/block") / block_name
+    if not block_path.exists():
+        return []
+
+    try:
+        resolved = block_path.resolve()
+    except OSError:
+        resolved = block_path
+    if (block_path / "partition").exists():
+        block_name = resolved.parent.name
+        block_path = Path("/sys/class/block") / block_name
+
+    try:
+        slaves = sorted((block_path / "slaves").iterdir())
+    except OSError:
+        slaves = []
+    if not slaves:
+        return [block_name]
+
+    names: set[str] = set()
+    for slave in slaves:
+        names.update(_physical_block_names(f"/dev/{slave.name}"))
+    return sorted(names) or [block_name]
+
+
+def physical_disk_info(device: str) -> list[dict[str, Any]]:
+    disks = []
+    for name in _physical_block_names(device):
+        path = Path("/sys/class/block") / name
+        sectors = _read_sysfs_value(path / "size")
+        rotational = _read_sysfs_value(path / "queue" / "rotational")
+        disks.append(
+            {
+                "name": name,
+                "device": f"/dev/{name}",
+                "model": _read_sysfs_value(path / "device" / "model"),
+                "size_bytes": int(sectors) * 512 if sectors and sectors.isdigit() else None,
+                "rotational": (
+                    rotational == "1" if rotational in {"0", "1"} else None
+                ),
+            }
+        )
+    return disks
 
 
 def collect_cpu_temperature() -> dict[str, Any]:
@@ -113,6 +172,7 @@ def collect_disks() -> list[dict[str, Any]]:
         disks.append(
             {
                 "device": partition.device,
+                "physical_disks": physical_disk_info(partition.device),
                 "mountpoint": partition.mountpoint,
                 "filesystem": partition.fstype,
                 "total_bytes": usage.total,

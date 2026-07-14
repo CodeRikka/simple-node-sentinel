@@ -6,6 +6,10 @@ const charts = new Map();
 let gpuSignature = null;
 let diskSignature = null;
 let historyData = null;
+let diskView = "mounts";
+let latestDisks = [];
+let latestUsers = [];
+let showSystemUsers = false;
 
 const COLORS = {
   cyan: "#22d3ee",
@@ -252,8 +256,81 @@ function renderGpus(gpus) {
 }
 
 function renderDisks(disks) {
+  latestDisks = disks;
+  if (diskView === "physical") {
+    clearCards("disk");
+    const groups = new Map();
+    disks.forEach((disk) => {
+      const physicalDisks = disk.physical_disks?.length
+        ? disk.physical_disks
+        : [{ name: disk.device, device: disk.device }];
+      physicalDisks.forEach((physical) => {
+        const key = physical.device || physical.name || disk.device;
+        const group = groups.get(key) || { ...physical, mounts: [] };
+        group.mounts.push(disk);
+        groups.set(key, group);
+      });
+    });
+    const cards = [...groups.values()].map((group) => {
+      const card = textElement("article", "card physical-disk-card", "");
+      const heading = textElement("div", "card-heading", "");
+      const headingText = textElement("div", "", "");
+      headingText.append(
+        textElement("h3", "", group.device || group.name),
+        textElement("p", "card-subtitle", group.model || "Physical disk"),
+      );
+      heading.appendChild(headingText);
+      card.appendChild(heading);
+
+      const uniqueFilesystems = new Map();
+      group.mounts.forEach((disk) => uniqueFilesystems.set(disk.device, disk));
+      const filesystems = [...uniqueFilesystems.values()];
+      const total = filesystems.reduce((sum, disk) => sum + Number(disk.total_bytes || 0), 0);
+      const used = filesystems.reduce((sum, disk) => sum + Number(disk.used_bytes || 0), 0);
+      const usage = total ? used / total * 100 : 0;
+
+      const overview = textElement("div", "physical-disk-overview", "");
+      const pie = textElement("div", "disk-pie", "");
+      pie.style.setProperty("--disk-usage", `${Math.min(100, usage) * 3.6}deg`);
+      pie.setAttribute("role", "img");
+      pie.setAttribute("aria-label", `${usage.toFixed(1)}% of mounted space used`);
+      pie.appendChild(textElement("strong", "", formatPercent(usage)));
+      const details = textElement("div", "physical-disk-details", "");
+      details.append(
+        textElement("span", "label", "Mounted space"),
+        textElement("strong", "", `${formatBytes(used)} / ${formatBytes(total)}`),
+        textElement("span", "label", "Drive capacity"),
+        textElement("strong", "", formatBytes(group.size_bytes)),
+        textElement("span", "label", "Type"),
+        textElement("strong", "", group.rotational == null
+          ? "N/A" : (group.rotational ? "HDD" : "SSD")),
+      );
+      overview.append(pie, details);
+      card.appendChild(overview);
+
+      const mounts = textElement("div", "physical-mounts", "");
+      mounts.appendChild(textElement("span", "chart-title", "Mounted filesystems"));
+      group.mounts.forEach((disk) => {
+        const row = textElement("div", "physical-mount", "");
+        row.append(
+          textElement("span", "", `${disk.mountpoint} · ${disk.filesystem}`),
+          textElement("strong", "", formatPercent(disk.usage_percent)),
+        );
+        mounts.appendChild(row);
+      });
+      card.appendChild(mounts);
+      return card;
+    });
+    $("#disks").replaceChildren(...cards);
+    if (!cards.length) $("#disks").appendChild(
+      textElement("p", "empty panel-empty", "No physical disk data available"),
+    );
+    diskSignature = "physical";
+    return;
+  }
+
   const signature = disks.map((disk) => disk.mountpoint).sort().join("|");
-  if (signature !== diskSignature) {
+  if (`mounts:${signature}` !== diskSignature) {
     clearCards("disk");
     const cards = disks.map((disk) => createMetricCard(
       `disk:${disk.mountpoint}`,
@@ -275,7 +352,7 @@ function renderDisks(disks) {
     if (!cards.length) $("#disks").appendChild(
       textElement("p", "empty panel-empty", "No physical disk data available"),
     );
-    diskSignature = signature;
+    diskSignature = `mounts:${signature}`;
   }
   disks.forEach((disk) => {
     const key = `disk:${disk.mountpoint}`;
@@ -284,6 +361,24 @@ function renderDisks(disks) {
     setMetric(key, "available", formatBytes(disk.available_bytes));
     setMetric(key, "total", formatBytes(disk.total_bytes));
   });
+}
+
+function renderUsers(users) {
+  latestUsers = users;
+  const systemUsers = users.filter((user) => user.is_primary === false);
+  const visibleUsers = showSystemUsers
+    ? users
+    : users.filter((user) => user.is_primary !== false);
+  replaceRows("#users", visibleUsers.map((user) => [
+    user.username, user.process_count, formatPercent(user.cpu_percent),
+    formatBytes(user.memory_rss_bytes), user.gpu_process_count, formatBytes(user.gpu_memory_bytes),
+  ]));
+  const button = $("#users-toggle");
+  button.hidden = !systemUsers.length;
+  button.textContent = showSystemUsers
+    ? "Hide system users"
+    : `Show system users (${systemUsers.length})`;
+  button.setAttribute("aria-pressed", String(showSystemUsers));
 }
 
 function replaceRows(selector, rows) {
@@ -338,10 +433,7 @@ async function refreshLive() {
     formatPercent(process.cpu_percent), formatBytes(process.memory_rss_bytes),
     formatDuration(process.runtime_seconds), process.command || process.executable,
   ]));
-  replaceRows("#users", users.map((user) => [
-    user.username, user.process_count, formatPercent(user.cpu_percent),
-    formatBytes(user.memory_rss_bytes), user.gpu_process_count, formatBytes(user.gpu_memory_bytes),
-  ]));
+  renderUsers(users);
   replaceRows("#alerts", alerts.map((alert) => [
     alert.gpu_index, new Date(alert.triggered_at * 1000).toLocaleString(), alert.status,
     formatTemperature(alert.current_temperature), formatTemperature(alert.max_temperature),
@@ -372,6 +464,19 @@ async function refreshHistory() {
 }
 
 $("#history-range").addEventListener("change", refreshHistory);
+$("#disk-view-toggle").addEventListener("click", () => {
+  diskView = diskView === "mounts" ? "physical" : "mounts";
+  $("#disk-view-toggle").textContent = diskView === "mounts"
+    ? "Group by physical disk"
+    : "Show mount points";
+  $("#disk-view-toggle").setAttribute("aria-pressed", String(diskView === "physical"));
+  renderDisks(latestDisks);
+  updateHistoryCharts();
+});
+$("#users-toggle").addEventListener("click", () => {
+  showSystemUsers = !showSystemUsers;
+  renderUsers(latestUsers);
+});
 updateLive();
 refreshHistory();
 setInterval(updateLive, 2000);

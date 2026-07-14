@@ -23,7 +23,12 @@ from simple_node_sentinel.database import Database
 from simple_node_sentinel.email_sender import EmailSender
 from simple_node_sentinel.main import create_app
 from simple_node_sentinel.process_end_manager import ProcessEndManager
-from simple_node_sentinel.process_monitor import ProcessMonitor, sanitize_command
+from simple_node_sentinel.process_monitor import (
+    ProcessMonitor,
+    is_primary_user,
+    login_uid_min,
+    sanitize_command,
+)
 from simple_node_sentinel.system_monitor import collect_disks
 
 
@@ -63,6 +68,12 @@ class CommandSanitizationTests(unittest.TestCase):
         self.assertEqual(monitor._cpu_percent(process, key), 12.5)
         self.assertEqual(monitor._cpu_percent(process, key), 12.5)
         process.cpu_percent.assert_called_once_with(interval=None)
+
+    def test_primary_users_include_root_and_login_uids(self) -> None:
+        self.assertTrue(is_primary_user("root", 0))
+        self.assertTrue(is_primary_user("alice", login_uid_min()))
+        self.assertFalse(is_primary_user("daemon", 1))
+        self.assertFalse(is_primary_user("nobody", 65534))
 
 
 class ConfigTests(unittest.TestCase):
@@ -393,9 +404,12 @@ class ProcessEndNotificationTests(unittest.TestCase):
 
 
 class DiskAndApiTests(unittest.TestCase):
+    @patch("simple_node_sentinel.system_monitor.physical_disk_info")
     @patch("simple_node_sentinel.system_monitor.psutil.disk_usage")
     @patch("simple_node_sentinel.system_monitor.psutil.disk_partitions")
-    def test_virtual_filesystems_are_filtered(self, partitions, usage) -> None:
+    def test_virtual_filesystems_are_filtered(
+        self, partitions, usage, physical_info
+    ) -> None:
         partitions.return_value = [
             SimpleNamespace(
                 device="/dev/sda1", mountpoint="/", fstype="ext4", opts="rw"
@@ -407,8 +421,19 @@ class DiskAndApiTests(unittest.TestCase):
         usage.return_value = SimpleNamespace(
             total=100, used=30, free=70, percent=30.0
         )
+        physical_info.return_value = [
+            {
+                "name": "sda",
+                "device": "/dev/sda",
+                "model": "Test disk",
+                "size_bytes": 1000,
+                "rotational": False,
+            }
+        ]
         disks = collect_disks()
         self.assertEqual([disk["mountpoint"] for disk in disks], ["/"])
+        self.assertEqual(disks[0]["physical_disks"][0]["device"], "/dev/sda")
+        physical_info.assert_called_once_with("/dev/sda1")
 
     def test_api_exposes_only_get_routes(self) -> None:
         app = create_app(Config(database=DatabaseConfig(path=":memory:")))

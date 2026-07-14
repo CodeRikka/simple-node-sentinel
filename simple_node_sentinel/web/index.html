@@ -47,7 +47,10 @@
       <section class="dashboard-section">
         <div class="section-heading">
           <div><span class="eyebrow">Storage</span><h2>Disks</h2></div>
-          <p>Capacity across physical mounts</p>
+          <div class="section-actions">
+            <p>Capacity across physical mounts</p>
+            <button id="disk-view-toggle" class="small-button" type="button">Group by physical disk</button>
+          </div>
         </div>
         <div id="disks" class="cards disk-cards"></div>
       </section>
@@ -65,6 +68,7 @@
       <section class="detail-section">
         <div class="section-heading">
           <div><span class="eyebrow">Allocation</span><h2>Users</h2></div>
+          <button id="users-toggle" class="small-button" type="button">Show system users</button>
         </div>
         <div class="table-wrap">
           <table id="users">

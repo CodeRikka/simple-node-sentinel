@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Iterable
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import psutil
@@ -20,6 +22,41 @@ SENSITIVE_OPTIONS = {
     "--wandb-api-key",
     "--hf-token",
 }
+
+
+@lru_cache(maxsize=1)
+def login_uid_min() -> int:
+    try:
+        lines = Path("/etc/login.defs").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return 1000
+    for line in lines:
+        values = line.split("#", 1)[0].split()
+        if len(values) == 2 and values[0] == "UID_MIN":
+            try:
+                return int(values[1])
+            except ValueError:
+                break
+    return 1000
+
+
+def is_primary_user(username: str, uid: int | None) -> bool:
+    if username == "root" or uid == 0:
+        return True
+    return uid is not None and login_uid_min() <= uid < 65534
+
+
+def _new_user_summary(username: str, uid: int | None) -> dict[str, Any]:
+    return {
+        "username": username,
+        "uid": uid,
+        "is_primary": is_primary_user(username, uid),
+        "process_count": 0,
+        "cpu_percent": 0.0,
+        "memory_rss_bytes": 0,
+        "gpu_process_count": 0,
+        "gpu_memory_bytes": 0,
+    }
 
 
 def sanitize_command(args: Iterable[str]) -> str:
@@ -124,26 +161,21 @@ class ProcessMonitor:
     ) -> list[dict[str, Any]]:
         summaries: dict[str, dict[str, Any]] = {}
         active_keys: set[tuple[int, float]] = set()
-        for process in psutil.process_iter(["pid", "username", "memory_info"]):
+        for process in psutil.process_iter(["pid", "username", "uids", "memory_info"]):
             try:
                 created = process.create_time()
                 key = (process.pid, created)
                 active_keys.add(key)
                 cached = self._process_cache.setdefault(key, process)
                 username = process.info.get("username") or cached.username()
+                uids = process.info.get("uids")
+                uid = uids.real if uids is not None else cached.uids().real
                 memory = process.info.get("memory_info")
                 rss = memory.rss if memory is not None else cached.memory_info().rss
                 cpu = self._cpu_percent(cached, key)
                 row = summaries.setdefault(
                     username,
-                    {
-                        "username": username,
-                        "process_count": 0,
-                        "cpu_percent": 0.0,
-                        "memory_rss_bytes": 0,
-                        "gpu_process_count": 0,
-                        "gpu_memory_bytes": 0,
-                    },
+                    _new_user_summary(username, uid),
                 )
                 row["process_count"] += 1
                 row["cpu_percent"] += cpu
@@ -158,16 +190,10 @@ class ProcessMonitor:
             username = process.get("username")
             if not username:
                 continue
+            uid = process.get("uid")
             row = summaries.setdefault(
                 username,
-                {
-                    "username": username,
-                    "process_count": 0,
-                    "cpu_percent": 0.0,
-                    "memory_rss_bytes": 0,
-                    "gpu_process_count": 0,
-                    "gpu_memory_bytes": 0,
-                },
+                _new_user_summary(username, uid),
             )
             user_pids = seen_gpu_pids.setdefault(username, set())
             if process["pid"] not in user_pids:
