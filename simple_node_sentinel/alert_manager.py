@@ -31,6 +31,48 @@ class AlertManager:
         self.database = database
         self.email_sender = email_sender
         self.states: dict[str, GpuAlertState] = {}
+        self._persisted_loaded = False
+
+    def _load_persisted_alerts(
+        self,
+        gpus: list[dict[str, Any]],
+        users_by_gpu: dict[str, set[str]],
+        monotonic_now: float,
+        wall_now: float,
+    ) -> None:
+        if self._persisted_loaded or not gpus:
+            return
+        current_gpus = {str(gpu["uuid"]): gpu for gpu in gpus}
+        for alert in self.database.list_active_alerts():
+            uuid = str(alert["gpu_uuid"])
+            gpu = current_gpus.get(uuid)
+            temperature = gpu.get("temperature_celsius") if gpu is not None else None
+            users = set(alert["users"])
+            users.update(users_by_gpu.get(uuid, set()))
+            maximum = float(alert["max_temperature"])
+            if temperature is not None:
+                temperature = float(temperature)
+                maximum = max(maximum, temperature)
+            if (
+                temperature is not None
+                and temperature < self.config.recovery_temperature_celsius
+            ):
+                self.database.update_alert(
+                    int(alert["id"]),
+                    users,
+                    temperature,
+                    maximum,
+                    recovered_at=wall_now,
+                )
+                continue
+            self.states[uuid] = GpuAlertState(
+                alert_id=int(alert["id"]),
+                users=users,
+                max_temperature=maximum,
+                current_temperature=temperature,
+                last_notification=monotonic_now,
+            )
+        self._persisted_loaded = True
 
     def _notify(
         self,
@@ -74,6 +116,7 @@ class AlertManager:
             if username:
                 users_by_gpu.setdefault(process["gpu_uuid"], set()).add(username)
 
+        self._load_persisted_alerts(gpus, users_by_gpu, now, wall)
         observed_gpus: set[str] = set()
         for gpu in gpus:
             uuid = gpu["uuid"]

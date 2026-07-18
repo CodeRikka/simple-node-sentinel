@@ -11,14 +11,16 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from .alert_manager import AlertManager
 from .config import Config, load_config
 from .database import Database
 from .email_sender import EmailSender
+from .gpu_fan_controller import FanControlError, GpuFanController
 from .gpu_monitor import GpuMonitor
 from .process_end_manager import ProcessEndManager
 from .process_monitor import ProcessMonitor
@@ -28,11 +30,18 @@ LOGGER = logging.getLogger(__name__)
 WEB_DIRECTORY = Path(__file__).with_name("web")
 
 
+class FanControlRequest(BaseModel):
+    mode: str
+    target_percent: int | None = None
+    expected_revision: int
+
+
 class SentinelService:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.database = Database(config.database.path)
         self.gpu_monitor = GpuMonitor()
+        self.fan_controller = GpuFanController()
         self.process_monitor = ProcessMonitor()
         self.email_sender = EmailSender(config.email, config.users)
         self.alert_manager = AlertManager(
@@ -44,6 +53,9 @@ class SentinelService:
             self.database,
         )
         self._snapshot_lock = threading.Lock()
+        self._fan_control_lock = threading.RLock()
+        self._fan_runtime: dict[str, dict[str, Any]] = {}
+        self._fan_restored: set[str] = set()
         self._snapshot: dict[str, Any] = {
             "summary": {},
             "gpus": [],
@@ -62,6 +74,8 @@ class SentinelService:
     async def start(self) -> None:
         self.database.open()
         self.gpu_monitor.initialize()
+        if self.config.fan_control.enabled:
+            self.fan_controller.initialize()
         self.running = True
         self._task = asyncio.create_task(self._run(), name="sentinel-collector")
 
@@ -74,6 +88,7 @@ class SentinelService:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        self.fan_controller.close()
         self.gpu_monitor.close()
         self.database.close()
 
@@ -94,6 +109,7 @@ class SentinelService:
     def collect_once(self) -> None:
         monotonic_now = time.monotonic()
         gpus, raw_gpu_processes = self.gpu_monitor.collect()
+        self._refresh_fan_controls(gpus)
         gpu_processes = self.process_monitor.inspect_gpu_processes(
             raw_gpu_processes
         )
@@ -152,6 +168,213 @@ class SentinelService:
             disks if disk_sampled else None,
         )
 
+    def _runtime_for_gpu(self, gpu_uuid: str) -> dict[str, Any]:
+        runtime = self._fan_runtime.get(gpu_uuid)
+        if runtime is not None:
+            return runtime
+        if not self.config.fan_control.enabled:
+            runtime = {
+                "supported": False,
+                "error": "Fan control is disabled by configuration",
+                "idle_locked": False,
+            }
+        elif not self.fan_controller.initialized:
+            runtime = {
+                "supported": False,
+                "error": self.fan_controller.last_error or "Fan control is unavailable",
+                "idle_locked": False,
+            }
+        else:
+            supported, error = self.fan_controller.supports(gpu_uuid)
+            runtime = {
+                "supported": supported,
+                "error": error,
+                "idle_locked": False,
+            }
+        self._fan_runtime[gpu_uuid] = runtime
+        return runtime
+
+    def _fan_payload(
+        self, gpu_uuid: str, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        runtime = self._runtime_for_gpu(gpu_uuid)
+        idle_locked = bool(runtime["idle_locked"])
+        return {
+            "enabled": self.config.fan_control.enabled,
+            "supported": bool(runtime["supported"]),
+            "mode": state["mode"],
+            "target_percent": state["target_percent"],
+            "revision": state["revision"],
+            "manual_allowed": bool(runtime["supported"]) and not idle_locked,
+            "idle_locked": idle_locked,
+            "error": runtime.get("error"),
+            "minimum_percent": self.config.fan_control.minimum_percent,
+            "maximum_percent": self.config.fan_control.maximum_percent,
+            "step_percent": self.config.fan_control.step_percent,
+            "idle_temperature_celsius": (
+                self.config.fan_control.idle_temperature_celsius
+            ),
+        }
+
+    def _refresh_fan_controls(self, gpus: list[dict[str, Any]]) -> None:
+        with self._fan_control_lock:
+            for gpu in gpus:
+                gpu_uuid = str(gpu["uuid"])
+                existing = self.database.get_fan_control_state(gpu_uuid)
+                state = existing or self.database.ensure_fan_control_state(gpu_uuid)
+                runtime = self._runtime_for_gpu(gpu_uuid)
+                control_succeeded = True
+                temperature = gpu.get("temperature_celsius")
+                process_count = int(gpu.get("process_count") or 0)
+                was_idle_locked = bool(runtime["idle_locked"])
+                if process_count > 0:
+                    idle_locked = False
+                elif temperature is None:
+                    idle_locked = was_idle_locked
+                elif float(temperature) < self.config.fan_control.idle_temperature_celsius:
+                    idle_locked = True
+                elif float(temperature) > self.config.fan_control.idle_temperature_celsius:
+                    idle_locked = False
+                else:
+                    idle_locked = was_idle_locked
+                runtime["idle_locked"] = idle_locked
+
+                if (
+                    runtime["supported"]
+                    and idle_locked
+                    and (
+                        state["mode"] == "manual"
+                        or not was_idle_locked
+                        or runtime.get("error") is not None
+                    )
+                ):
+                    try:
+                        self.fan_controller.set_auto(gpu_uuid)
+                        if state["mode"] == "manual":
+                            updated = self.database.update_fan_control_state(
+                                gpu_uuid, "auto", None, int(state["revision"])
+                            )
+                            if updated is not None:
+                                state = updated
+                        runtime["error"] = None
+                    except FanControlError as exc:
+                        control_succeeded = False
+                        runtime["error"] = str(exc)
+                        LOGGER.error("Unable to restore automatic fan control: %s", exc)
+
+                if (
+                    runtime["supported"]
+                    and gpu_uuid not in self._fan_restored
+                    and existing is not None
+                    and not idle_locked
+                ):
+                    try:
+                        if state["mode"] == "manual":
+                            self.fan_controller.set_manual(
+                                gpu_uuid, int(state["target_percent"])
+                            )
+                        else:
+                            self.fan_controller.set_auto(gpu_uuid)
+                        runtime["error"] = None
+                    except (FanControlError, TypeError, ValueError) as exc:
+                        control_succeeded = False
+                        runtime["error"] = str(exc)
+                        LOGGER.error("Unable to restore fan state for %s: %s", gpu_uuid, exc)
+                if control_succeeded:
+                    self._fan_restored.add(gpu_uuid)
+                gpu["fan_control"] = self._fan_payload(gpu_uuid, state)
+
+    def set_fan_control(
+        self,
+        gpu_uuid: str,
+        mode: str,
+        target_percent: int | None,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        if mode not in {"auto", "manual"}:
+            raise HTTPException(status_code=422, detail="mode must be auto or manual")
+        config = self.config.fan_control
+        if mode == "manual":
+            if target_percent is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="target_percent is required in manual mode",
+                )
+            if (
+                target_percent < config.minimum_percent
+                or target_percent > config.maximum_percent
+                or (target_percent - config.minimum_percent) % config.step_percent
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"target_percent must be {config.minimum_percent}-"
+                        f"{config.maximum_percent} in {config.step_percent}% steps"
+                    ),
+                )
+        else:
+            target_percent = None
+
+        with self._fan_control_lock:
+            state = self.database.get_fan_control_state(gpu_uuid)
+            if state is None:
+                raise HTTPException(status_code=404, detail="GPU not found")
+            runtime = self._runtime_for_gpu(gpu_uuid)
+            current = self._fan_payload(gpu_uuid, state)
+            if int(state["revision"]) != expected_revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "Fan state changed", "fan_control": current},
+                )
+            if not runtime["supported"]:
+                raise HTTPException(
+                    status_code=503,
+                    detail=runtime.get("error") or "Fan control is unavailable",
+                )
+            if mode == "manual" and runtime["idle_locked"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            "Manual control is locked while the GPU is idle "
+                            "and below the temperature threshold"
+                        ),
+                        "fan_control": current,
+                    },
+                )
+            try:
+                if mode == "manual":
+                    self.fan_controller.set_manual(gpu_uuid, int(target_percent))
+                else:
+                    self.fan_controller.set_auto(gpu_uuid)
+            except FanControlError as exc:
+                runtime["error"] = str(exc)
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            updated = self.database.update_fan_control_state(
+                gpu_uuid, mode, target_percent, expected_revision
+            )
+            if updated is None:
+                latest = self.database.get_fan_control_state(gpu_uuid)
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Fan state changed",
+                        "fan_control": (
+                            self._fan_payload(gpu_uuid, latest)
+                            if latest is not None
+                            else None
+                        ),
+                    },
+                )
+            runtime["error"] = None
+            payload = self._fan_payload(gpu_uuid, updated)
+            with self._snapshot_lock:
+                for gpu in self._snapshot["gpus"]:
+                    if gpu.get("uuid") == gpu_uuid:
+                        gpu["fan_control"] = copy.deepcopy(payload)
+                        break
+            return payload
+
     def snapshot(self, key: str) -> Any:
         with self._snapshot_lock:
             return copy.deepcopy(self._snapshot[key])
@@ -164,6 +387,13 @@ class SentinelService:
             "last_error": self.last_error,
             "nvml_available": self.gpu_monitor.initialized,
             "nvml_error": self.gpu_monitor.last_error,
+            "fan_control_enabled": self.config.fan_control.enabled,
+            "fan_control_available": self.fan_controller.initialized,
+            "fan_control_error": (
+                self.fan_controller.last_error
+                if self.config.fan_control.enabled
+                else "Fan control is disabled by configuration"
+            ),
         }
 
 
@@ -201,6 +431,17 @@ def create_app(config: Config) -> FastAPI:
     @application.get("/api/gpus")
     def gpus() -> list[dict[str, Any]]:
         return service.snapshot("gpus")
+
+    @application.put("/api/gpus/{gpu_uuid}/fan-control")
+    def set_gpu_fan_control(
+        gpu_uuid: str, request: FanControlRequest
+    ) -> dict[str, Any]:
+        return service.set_fan_control(
+            gpu_uuid,
+            request.mode,
+            request.target_percent,
+            request.expected_revision,
+        )
 
     @application.get("/api/gpu-processes")
     def gpu_processes() -> list[dict[str, Any]]:

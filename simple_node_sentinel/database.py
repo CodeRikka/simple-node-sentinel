@@ -60,6 +60,13 @@ class Database:
                     error TEXT,
                     FOREIGN KEY(alert_id) REFERENCES alerts(id)
                 );
+                CREATE TABLE IF NOT EXISTS gpu_fan_control_state (
+                    gpu_uuid TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL CHECK(mode IN ('auto', 'manual')),
+                    target_percent INTEGER,
+                    revision INTEGER NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_process_ended
                     ON gpu_process_records(ended_at);
                 CREATE INDEX IF NOT EXISTS idx_alert_recovered
@@ -126,6 +133,59 @@ class Database:
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
+
+    def ensure_fan_control_state(self, gpu_uuid: str) -> dict[str, Any]:
+        now = time.time()
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO gpu_fan_control_state (
+                    gpu_uuid, mode, target_percent, revision, updated_at
+                ) VALUES (?, 'auto', NULL, 0, ?)
+                """,
+                (gpu_uuid, now),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM gpu_fan_control_state WHERE gpu_uuid=?",
+                (gpu_uuid,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("unable to create GPU fan control state")
+        return dict(row)
+
+    def get_fan_control_state(self, gpu_uuid: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM gpu_fan_control_state WHERE gpu_uuid=?",
+                (gpu_uuid,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def update_fan_control_state(
+        self,
+        gpu_uuid: str,
+        mode: str,
+        target_percent: int | None,
+        expected_revision: int,
+        updated_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        now = updated_at if updated_at is not None else time.time()
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE gpu_fan_control_state
+                SET mode=?, target_percent=?, revision=revision + 1, updated_at=?
+                WHERE gpu_uuid=? AND revision=?
+                """,
+                (mode, target_percent, now, gpu_uuid, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = self.connection.execute(
+                "SELECT * FROM gpu_fan_control_state WHERE gpu_uuid=?",
+                (gpu_uuid,),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def reconcile_gpu_processes(
         self, processes: Iterable[dict[str, Any]], observed_at: float | None = None
@@ -226,7 +286,7 @@ class Database:
                 UPDATE alerts
                 SET users_json=?, current_temperature=?, max_temperature=?,
                     recovered_at=?, status=?
-                WHERE id=?
+                WHERE id=? AND status='active'
                 """,
                 (
                     json.dumps(sorted(set(users))),
@@ -237,6 +297,22 @@ class Database:
                     alert_id,
                 ),
             )
+
+    def list_active_alerts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM alerts
+                WHERE status='active' AND recovered_at IS NULL
+                ORDER BY triggered_at
+                """
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["users"] = json.loads(item.pop("users_json"))
+            result.append(item)
+        return result
 
     def record_email(
         self,

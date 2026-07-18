@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import psutil
+from fastapi import HTTPException
 
 from simple_node_sentinel.alert_manager import AlertManager
 from simple_node_sentinel.config import (
@@ -15,13 +16,18 @@ from simple_node_sentinel.config import (
     Config,
     DatabaseConfig,
     EmailConfig,
+    FanControlConfig,
     ProcessEndNotificationConfig,
     UserConfig,
     load_config,
 )
 from simple_node_sentinel.database import Database
 from simple_node_sentinel.email_sender import EmailSender
-from simple_node_sentinel.main import create_app
+from simple_node_sentinel.gpu_fan_controller import (
+    FanControlError,
+    GpuFanController,
+)
+from simple_node_sentinel.main import SentinelService, create_app
 from simple_node_sentinel.process_end_manager import ProcessEndManager
 from simple_node_sentinel.process_monitor import (
     ProcessMonitor,
@@ -99,7 +105,184 @@ class ConfigTests(unittest.TestCase):
                 load_config(path)
 
 
+class FanControllerTests(unittest.TestCase):
+    def test_manual_and_auto_apply_to_every_fan(self) -> None:
+        controller = GpuFanController()
+        controller.initialized = True
+        controller.library = Mock()
+        controller.library.nvmlDeviceSetFanSpeed_v2.return_value = 0
+        controller.library.nvmlDeviceSetDefaultFanSpeed_v2.return_value = 0
+        handle = object()
+        with (
+            patch.object(controller, "_handle_by_uuid", return_value=handle),
+            patch.object(controller, "_fan_count", return_value=2),
+        ):
+            controller.set_manual("GPU-1", 75)
+            controller.set_auto("GPU-1")
+        self.assertEqual(
+            controller.library.nvmlDeviceSetFanSpeed_v2.call_args_list,
+            [unittest.mock.call(handle, 0, 75), unittest.mock.call(handle, 1, 75)],
+        )
+        self.assertEqual(
+            controller.library.nvmlDeviceSetDefaultFanSpeed_v2.call_args_list,
+            [unittest.mock.call(handle, 0), unittest.mock.call(handle, 1)],
+        )
+
+    def test_partial_manual_failure_attempts_automatic_rollback(self) -> None:
+        controller = GpuFanController()
+        controller.initialized = True
+        controller.library = Mock()
+        controller.library.nvmlDeviceSetFanSpeed_v2.side_effect = [0, 1]
+        controller.library.nvmlDeviceSetDefaultFanSpeed_v2.return_value = 0
+        controller.library.nvmlErrorString.return_value = b"Not supported"
+        with (
+            patch.object(controller, "_handle_by_uuid", return_value=object()),
+            patch.object(controller, "_fan_count", return_value=2),
+            self.assertRaises(FanControlError),
+        ):
+            controller.set_manual("GPU-1", 80)
+        self.assertEqual(
+            controller.library.nvmlDeviceSetDefaultFanSpeed_v2.call_count, 2
+        )
+
+
+class FanControlServiceTests(unittest.TestCase):
+    def make_service(self) -> SentinelService:
+        service = SentinelService(
+            Config(
+                database=DatabaseConfig(path=":memory:"),
+                fan_control=FanControlConfig(),
+            )
+        )
+        service.database.open()
+        service.fan_controller.initialized = True
+        service.fan_controller.supports = Mock(return_value=(True, None))
+        service.fan_controller.set_auto = Mock()
+        service.fan_controller.set_manual = Mock()
+        return service
+
+    def test_idle_low_temperature_forces_auto_and_unlocks_on_process(self) -> None:
+        service = self.make_service()
+        try:
+            state = service.database.ensure_fan_control_state("GPU-1")
+            service.database.update_fan_control_state(
+                "GPU-1", "manual", 80, state["revision"]
+            )
+            gpu = {
+                "uuid": "GPU-1",
+                "process_count": 0,
+                "temperature_celsius": 55,
+            }
+            service._refresh_fan_controls([gpu])
+            state = service.database.get_fan_control_state("GPU-1")
+            self.assertEqual(state["mode"], "auto")
+            self.assertTrue(gpu["fan_control"]["idle_locked"])
+            self.assertFalse(gpu["fan_control"]["manual_allowed"])
+            service.fan_controller.set_auto.assert_called_once_with("GPU-1")
+
+            gpu["process_count"] = 1
+            service._refresh_fan_controls([gpu])
+            self.assertFalse(gpu["fan_control"]["idle_locked"])
+            self.assertTrue(gpu["fan_control"]["manual_allowed"])
+            self.assertEqual(gpu["fan_control"]["mode"], "auto")
+        finally:
+            service.database.close()
+
+    def test_unknown_temperature_does_not_start_idle_lock(self) -> None:
+        service = self.make_service()
+        try:
+            gpu = {
+                "uuid": "GPU-1",
+                "process_count": 0,
+                "temperature_celsius": None,
+            }
+            service._refresh_fan_controls([gpu])
+            self.assertFalse(gpu["fan_control"]["idle_locked"])
+            service.fan_controller.set_auto.assert_not_called()
+        finally:
+            service.database.close()
+
+    def test_persisted_manual_state_is_restored_by_uuid(self) -> None:
+        service = self.make_service()
+        try:
+            state = service.database.ensure_fan_control_state("GPU-stable")
+            service.database.update_fan_control_state(
+                "GPU-stable", "manual", 85, state["revision"]
+            )
+            service._refresh_fan_controls(
+                [
+                    {
+                        "uuid": "GPU-stable",
+                        "index": 7,
+                        "process_count": 0,
+                        "temperature_celsius": 70,
+                    }
+                ]
+            )
+            service.fan_controller.set_manual.assert_called_once_with(
+                "GPU-stable", 85
+            )
+        finally:
+            service.database.close()
+
+    def test_stale_revision_is_rejected_without_second_hardware_write(self) -> None:
+        service = self.make_service()
+        try:
+            service.database.ensure_fan_control_state("GPU-1")
+            service._fan_runtime["GPU-1"] = {
+                "supported": True,
+                "error": None,
+                "idle_locked": False,
+            }
+            first = service.set_fan_control("GPU-1", "manual", 75, 0)
+            self.assertEqual(first["revision"], 1)
+            with self.assertRaises(HTTPException) as raised:
+                service.set_fan_control("GPU-1", "manual", 80, 0)
+            self.assertEqual(raised.exception.status_code, 409)
+            service.fan_controller.set_manual.assert_called_once_with("GPU-1", 75)
+        finally:
+            service.database.close()
+
+    def test_failed_hardware_write_does_not_change_persisted_state(self) -> None:
+        service = self.make_service()
+        try:
+            service.database.ensure_fan_control_state("GPU-1")
+            service._fan_runtime["GPU-1"] = {
+                "supported": True,
+                "error": None,
+                "idle_locked": False,
+            }
+            service.fan_controller.set_manual.side_effect = FanControlError("failed")
+            with self.assertRaises(HTTPException) as raised:
+                service.set_fan_control("GPU-1", "manual", 75, 0)
+            self.assertEqual(raised.exception.status_code, 503)
+            state = service.database.get_fan_control_state("GPU-1")
+            self.assertEqual(state["mode"], "auto")
+            self.assertEqual(state["revision"], 0)
+        finally:
+            service.database.close()
+
+
 class DatabaseTests(unittest.TestCase):
+    def test_fan_control_state_uses_revision_and_survives_cleanup(self) -> None:
+        database = Database(":memory:")
+        database.open()
+        try:
+            initial = database.ensure_fan_control_state("GPU-1")
+            updated = database.update_fan_control_state(
+                "GPU-1", "manual", 75, initial["revision"], updated_at=100
+            )
+            self.assertEqual(updated["revision"], 1)
+            self.assertIsNone(
+                database.update_fan_control_state("GPU-1", "manual", 80, 0)
+            )
+            database.cleanup(retention_days=1, now=10 * 86400)
+            persisted = database.get_fan_control_state("GPU-1")
+            self.assertEqual(persisted["mode"], "manual")
+            self.assertEqual(persisted["target_percent"], 75)
+        finally:
+            database.close()
+
     def test_metric_history_is_grouped_and_preserves_temperature_peaks(self) -> None:
         database = Database(":memory:")
         database.open()
@@ -249,6 +432,57 @@ class DatabaseTests(unittest.TestCase):
 
 
 class AlertTests(unittest.TestCase):
+    def test_restart_scan_recovers_persisted_active_alert(self) -> None:
+        database = Database(":memory:")
+        database.open()
+        try:
+            gpu = {"uuid": "GPU-1", "index": 0, "temperature_celsius": 90}
+            alert_id = database.create_alert(
+                gpu, {"alice"}, temperature=90, triggered_at=100
+            )
+            manager = AlertManager(
+                AlertConfig(),
+                database,
+                EmailSender(EmailConfig(enabled=False), {}),
+            )
+            recovered_gpu = {
+                "uuid": "GPU-1",
+                "index": 0,
+                "temperature_celsius": 70,
+            }
+            manager.evaluate(
+                [recovered_gpu], [], monotonic_now=10, wall_now=200
+            )
+            alert = next(
+                item for item in database.list_alerts() if item["id"] == alert_id
+            )
+            self.assertEqual(alert["status"], "recovered")
+            self.assertEqual(alert["recovered_at"], 200)
+            self.assertEqual(alert["current_temperature"], 70)
+        finally:
+            database.close()
+
+    def test_recovered_alert_cannot_be_changed_back_to_active(self) -> None:
+        database = Database(":memory:")
+        database.open()
+        try:
+            gpu = {"uuid": "GPU-1", "index": 0}
+            alert_id = database.create_alert(
+                gpu, set(), temperature=90, triggered_at=100
+            )
+            database.update_alert(
+                alert_id, set(), 70, 90, recovered_at=200
+            )
+            database.update_alert(alert_id, {"alice"}, 95, 95)
+            alert = next(
+                item for item in database.list_alerts() if item["id"] == alert_id
+            )
+            self.assertEqual(alert["status"], "recovered")
+            self.assertEqual(alert["recovered_at"], 200)
+            self.assertEqual(alert["current_temperature"], 70)
+        finally:
+            database.close()
+
     def test_alert_reminder_and_recovery_state_machine(self) -> None:
         database = Database(":memory:")
         database.open()
@@ -435,7 +669,7 @@ class DiskAndApiTests(unittest.TestCase):
         self.assertEqual(disks[0]["physical_disks"][0]["device"], "/dev/sda")
         physical_info.assert_called_once_with("/dev/sda1")
 
-    def test_api_exposes_only_get_routes(self) -> None:
+    def test_api_exposes_monitoring_and_fan_control_routes(self) -> None:
         app = create_app(Config(database=DatabaseConfig(path=":memory:")))
         monitored_paths = {
             "/api/summary",
@@ -455,6 +689,13 @@ class DiskAndApiTests(unittest.TestCase):
         self.assertEqual(set(route_methods), monitored_paths)
         for methods in route_methods.values():
             self.assertEqual(methods, {"GET"})
+        fan_route = next(
+            route
+            for route in app.routes
+            if getattr(route, "path", None)
+            == "/api/gpus/{gpu_uuid}/fan-control"
+        )
+        self.assertEqual(fan_route.methods, {"PUT"})
 
         history_route = next(
             route for route in app.routes if getattr(route, "path", None) == "/api/history"

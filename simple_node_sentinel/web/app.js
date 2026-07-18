@@ -3,10 +3,11 @@
 const $ = (selector) => document.querySelector(selector);
 const metricNodes = new Map();
 const charts = new Map();
+const fanControls = new Map();
 let gpuSignature = null;
 let diskSignature = null;
 let historyData = null;
-let diskView = "mounts";
+let diskView = "physical";
 let latestDisks = [];
 let latestUsers = [];
 let showSystemUsers = false;
@@ -130,6 +131,172 @@ function clearCards(prefix) {
   for (const key of [...charts.keys()]) {
     if (key.startsWith(`${prefix}:`)) charts.delete(key);
   }
+  if (prefix === "gpu") fanControls.clear();
+}
+
+function fanColor(temperature) {
+  if (temperature === null || temperature === undefined) return "#718096";
+  const bounded = Math.max(60, Math.min(90, Number(temperature)));
+  const hue = 130 * (90 - bounded) / 30;
+  return `hsl(${hue} 72% 48%)`;
+}
+
+function createFanIcon() {
+  const namespace = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(namespace, "svg");
+  svg.setAttribute("viewBox", "0 0 64 64");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "GPU fan status");
+  svg.classList.add("fan-icon");
+  const rotor = document.createElementNS(namespace, "g");
+  rotor.classList.add("fan-rotor");
+  [
+    "M32 28C22 25 18 15 23 8c7-7 15 2 12 15l-3 5Z",
+    "M36 32c3-10 13-14 20-9 7 7-2 15-15 12l-5-3Z",
+    "M32 36c10 3 14 13 9 20-7 7-15-2-12-15l3-5Z",
+    "M28 32c-3 10-13 14-20 9-7-7 2-15 15-12l5 3Z",
+  ].forEach((data) => {
+    const path = document.createElementNS(namespace, "path");
+    path.setAttribute("d", data);
+    rotor.appendChild(path);
+  });
+  const hub = document.createElementNS(namespace, "circle");
+  hub.setAttribute("cx", "32");
+  hub.setAttribute("cy", "32");
+  hub.setAttribute("r", "5");
+  rotor.appendChild(hub);
+  svg.appendChild(rotor);
+  return svg;
+}
+
+function updateFanSliderProgress(nodes) {
+  const minimum = Number(nodes.slider.min);
+  const maximum = Number(nodes.slider.max);
+  const value = Number(nodes.slider.value);
+  const progress = maximum > minimum
+    ? (value - minimum) / (maximum - minimum) * 100
+    : 0;
+  nodes.slider.style.setProperty("--slider-progress", `${progress}%`);
+}
+
+function createFanControl(gpu) {
+  const control = textElement("div", "fan-control", "");
+  const header = textElement("div", "fan-control-header", "");
+  const visual = textElement("div", "fan-visual", "");
+  const icon = createFanIcon();
+  const actual = textElement("strong", "", "N/A");
+  visual.append(icon, actual);
+
+  const switchLabel = textElement("label", "fan-switch", "");
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.setAttribute("role", "switch");
+  const switchTrack = textElement("span", "fan-switch-track", "");
+  const modeLabel = textElement("span", "", "Automatic");
+  switchLabel.append(checkbox, switchTrack, modeLabel);
+  header.append(visual, switchLabel);
+
+  const sliderRow = textElement("label", "fan-slider-row", "");
+  const sliderLabel = textElement("span", "", "Manual target");
+  const sliderShell = textElement("span", "fan-slider-shell", "");
+  const slider = document.createElement("input");
+  slider.type = "range";
+  const ticks = textElement("span", "fan-slider-ticks", "");
+  sliderShell.append(slider, ticks);
+  const target = textElement("strong", "", "60%");
+  sliderRow.append(sliderLabel, sliderShell, target);
+  const message = textElement("p", "fan-control-message", "");
+  control.append(header, sliderRow, message);
+
+  const state = {
+    checkbox, modeLabel, slider, ticks, target, message, icon, actual,
+    pending: false, editing: false, latest: gpu,
+  };
+  fanControls.set(gpu.uuid, state);
+  slider.addEventListener("input", () => {
+    state.editing = true;
+    target.textContent = `${slider.value}%`;
+    updateFanSliderProgress(state);
+  });
+  slider.addEventListener("change", () => {
+    state.editing = false;
+    if (checkbox.checked) submitFanControl(gpu.uuid, "manual", Number(slider.value));
+  });
+  checkbox.addEventListener("change", () => {
+    const mode = checkbox.checked ? "manual" : "auto";
+    const percent = checkbox.checked ? Number(slider.value) : null;
+    submitFanControl(gpu.uuid, mode, percent);
+  });
+  return control;
+}
+
+function updateFanControl(gpu, overrideMessage = null) {
+  const nodes = fanControls.get(gpu.uuid);
+  if (!nodes) return;
+  nodes.latest = gpu;
+  const state = gpu.fan_control || {};
+  const supported = Boolean(state.supported);
+  const manual = state.mode === "manual";
+  nodes.checkbox.checked = manual;
+  nodes.modeLabel.textContent = manual ? "Manual" : "Automatic";
+  nodes.slider.min = state.minimum_percent ?? 60;
+  nodes.slider.max = state.maximum_percent ?? 90;
+  nodes.slider.step = state.step_percent ?? 5;
+  const tickSignature = `${nodes.slider.min}:${nodes.slider.max}:${nodes.slider.step}`;
+  if (nodes.ticks.dataset.signature !== tickSignature) {
+    nodes.ticks.dataset.signature = tickSignature;
+    nodes.ticks.replaceChildren();
+    const count = (
+      (Number(nodes.slider.max) - Number(nodes.slider.min))
+      / Number(nodes.slider.step)
+    ) + 1;
+    for (let index = 0; index < count; index += 1) {
+      nodes.ticks.appendChild(textElement("i", "", ""));
+    }
+  }
+  if (!nodes.editing && !nodes.pending) {
+    nodes.slider.value = state.target_percent ?? nodes.slider.min;
+    nodes.target.textContent = `${nodes.slider.value}%`;
+  }
+  updateFanSliderProgress(nodes);
+  nodes.checkbox.disabled = (
+    nodes.pending || !supported || (!state.manual_allowed && !manual)
+  );
+  nodes.slider.disabled = nodes.pending || !supported || !state.manual_allowed || !manual;
+
+  const speed = Number(gpu.fan_percent);
+  nodes.actual.textContent = formatPercent(gpu.fan_percent);
+  nodes.icon.style.setProperty("--fan-color", fanColor(gpu.temperature_celsius));
+  if (Number.isFinite(speed) && speed > 0) {
+    nodes.icon.style.setProperty("--fan-duration", `${Math.max(.3, 4 - speed * .035)}s`);
+    nodes.icon.classList.add("spinning");
+  } else {
+    nodes.icon.classList.remove("spinning");
+  }
+  nodes.icon.setAttribute(
+    "aria-label",
+    `GPU fan ${formatPercent(gpu.fan_percent)}, temperature ${formatTemperature(gpu.temperature_celsius)}`,
+  );
+
+  if (overrideMessage) {
+    nodes.message.textContent = overrideMessage;
+    nodes.message.className = "fan-control-message error";
+  } else if (state.idle_locked) {
+    nodes.message.textContent = (
+      `Idle below ${state.idle_temperature_celsius ?? 60}°C — `
+      + "NVIDIA automatic mode is enforced."
+    );
+    nodes.message.className = "fan-control-message";
+  } else if (!supported) {
+    nodes.message.textContent = state.error || "Fan control is unavailable.";
+    nodes.message.className = "fan-control-message error";
+  } else if (state.error) {
+    nodes.message.textContent = state.error;
+    nodes.message.className = "fan-control-message error";
+  } else {
+    nodes.message.textContent = nodes.pending ? "Applying…" : "";
+    nodes.message.className = "fan-control-message";
+  }
 }
 
 function setupSystemCards() {
@@ -199,41 +366,45 @@ function renderGpus(gpus) {
   const signature = gpus.map((gpu) => gpu.uuid).sort().join("|");
   if (signature !== gpuSignature) {
     clearCards("gpu");
-    const cards = gpus.map((gpu) => createMetricCard(
-      `gpu:${gpu.uuid}`,
-      `GPU ${gpu.index}`,
-      gpu.name,
-      [
-        { id: "utilization", primary: true },
-        { id: "temperature", label: "Temperature" },
-        { id: "memory", label: "Memory" },
-        { id: "fan", label: "Fan" },
-        { id: "power", label: "Power" },
-        { id: "workloads", label: "Workloads" },
-      ],
-      [
-        {
-          id: "load",
-          title: "Compute and memory load",
-          series: [
-            series("utilization_percent", "GPU", COLORS.cyan),
-            series("memory_used_bytes", "VRAM", COLORS.violet, formatPercent,
-              (point) => point.memory_total_bytes
-                ? point.memory_used_bytes / point.memory_total_bytes * 100 : null),
-          ],
-        },
-        {
-          id: "thermal",
-          title: "Thermals and power",
-          series: [
-            series("temperature_celsius", "Temperature", COLORS.rose, formatTemperature),
-            series("power_watts", "Power", COLORS.amber, formatPercent,
-              (point) => point.power_limit_watts
-                ? point.power_watts / point.power_limit_watts * 100 : null),
-          ],
-        },
-      ],
-    ));
+    const cards = gpus.map((gpu) => {
+      const card = createMetricCard(
+        `gpu:${gpu.uuid}`,
+        `GPU ${gpu.index}`,
+        gpu.name,
+        [
+          { id: "utilization", primary: true },
+          { id: "temperature", label: "Temperature" },
+          { id: "memory", label: "Memory" },
+          { id: "fan", label: "Fan" },
+          { id: "power", label: "Power" },
+          { id: "workloads", label: "Workloads" },
+        ],
+        [
+          {
+            id: "load",
+            title: "Compute and memory load",
+            series: [
+              series("utilization_percent", "GPU", COLORS.cyan),
+              series("memory_used_bytes", "VRAM", COLORS.violet, formatPercent,
+                (point) => point.memory_total_bytes
+                  ? point.memory_used_bytes / point.memory_total_bytes * 100 : null),
+            ],
+          },
+          {
+            id: "thermal",
+            title: "Thermals and power",
+            series: [
+              series("temperature_celsius", "Temperature", COLORS.rose, formatTemperature),
+              series("power_watts", "Power", COLORS.amber, formatPercent,
+                (point) => point.power_limit_watts
+                  ? point.power_watts / point.power_limit_watts * 100 : null),
+            ],
+          },
+        ],
+      );
+      card.appendChild(createFanControl(gpu));
+      return card;
+    });
     $("#gpus").replaceChildren(...cards);
     if (!cards.length) $("#gpus").appendChild(
       textElement("p", "empty panel-empty", "No NVIDIA GPU data available"),
@@ -252,6 +423,7 @@ function renderGpus(gpus) {
     setMetric(key, "workloads",
       `${gpu.process_count} process${gpu.process_count === 1 ? "" : "es"} · `
       + ((gpu.users || []).join(", ") || "No users"));
+    updateFanControl(gpu);
   });
 }
 
@@ -414,10 +586,51 @@ function updateHistoryCharts() {
   });
 }
 
-async function request(path) {
-  const response = await fetch(path, { cache: "no-store" });
-  if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
-  return response.json();
+async function request(path, options = {}) {
+  const response = await fetch(path, { cache: "no-store", ...options });
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(
+      typeof data?.detail === "string"
+        ? data.detail
+        : (data?.detail?.message || `${path}: HTTP ${response.status}`),
+    );
+    error.status = response.status;
+    error.detail = data?.detail;
+    throw error;
+  }
+  return data;
+}
+
+async function submitFanControl(gpuUuid, mode, targetPercent) {
+  const nodes = fanControls.get(gpuUuid);
+  const control = nodes?.latest?.fan_control;
+  if (!nodes || !control || nodes.pending) return;
+  nodes.pending = true;
+  updateFanControl(nodes.latest);
+  try {
+    const updated = await request(`/api/gpus/${encodeURIComponent(gpuUuid)}/fan-control`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mode,
+        target_percent: targetPercent,
+        expected_revision: control.revision,
+      }),
+    });
+    nodes.latest.fan_control = updated;
+    nodes.pending = false;
+    updateFanControl(nodes.latest);
+  } catch (error) {
+    nodes.pending = false;
+    if (error.detail?.fan_control) {
+      nodes.latest.fan_control = error.detail.fan_control;
+    }
+    const message = error.status === 409
+      ? `Not applied: ${error.message}. The latest state is shown.`
+      : `Unable to apply: ${error.message}`;
+    updateFanControl(nodes.latest, message);
+  }
 }
 
 async function refreshLive() {

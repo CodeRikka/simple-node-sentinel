@@ -1,9 +1,9 @@
 # Simple Node Sentinel
 
-A small, read-only monitor for multi-user Ubuntu NVIDIA GPU servers. It uses
-FastAPI, psutil, NVML and SQLite, with a dependency-free browser interface.
-It never kills processes, controls hardware, or executes commands received
-from users.
+A small monitor and GPU fan controller for multi-user Ubuntu NVIDIA GPU
+servers. It uses FastAPI, psutil, NVML and SQLite, with a dependency-free
+browser interface. It never kills processes or executes commands received
+from users. Fan changes use a fixed NVML API with validated values.
 
 ## What it monitors
 
@@ -14,6 +14,7 @@ from users.
 - GPU process owner, sanitized command, runtime, CPU, RAM and GPU memory
 - Per-user process, CPU, RAM and GPU totals
 - Sustained GPU temperature alerts and optional SMTP delivery
+- Per-GPU NVIDIA automatic or 60–90% manual fan control
 
 The latest snapshot stays in memory for fast live updates. SQLite also stores
 system, GPU and disk metric history, GPU process lifetimes, temperature alert
@@ -25,6 +26,9 @@ default and is downsampled by the API before it reaches the browser.
 - Ubuntu with Python 3.10 or newer
 - NVIDIA driver providing NVML
 - Root for production, so processes belonging to other users can be inspected
+- A GPU/driver combination exposing `nvmlDeviceGetNumFans`,
+  `nvmlDeviceSetFanSpeed_v2` and `nvmlDeviceSetDefaultFanSpeed_v2` for fan
+  control. Monitoring continues normally when these calls are unavailable.
 - Optional CPU sensor setup:
 
 ```bash
@@ -76,10 +80,35 @@ records. At the default two-second collection interval, multi-GPU nodes can use
 several hundred MiB for three days of history; monitor the database file when
 choosing a longer retention period.
 
+`fan_control` enables the dashboard controls and defines the allowed manual
+range. The supplied configuration allows 60–90% in 5% steps. When a GPU has no
+NVML compute processes and its temperature is below 60°C, the service restores
+NVIDIA automatic fan control and temporarily disables manual mode. Manual mode
+becomes available again when a process appears or the temperature rises above
+60°C; it is not automatically re-enabled.
+
+```yaml
+fan_control:
+  enabled: true
+  minimum_percent: 60
+  maximum_percent: 90
+  step_percent: 5
+  idle_temperature_celsius: 60
+```
+
+Fan control has no separate login or administrator role. Every user who can
+reach the dashboard can change it. Keep the service bound to localhost and
+grant SSH access only to trusted users. Set `fan_control.enabled: false` to
+retain a read-only deployment.
+
 Temperature alerts are sent after five continuous minutes above the configured
 threshold, with at most one alert per GPU every two hours. Recovery is recorded
 after five continuous minutes below the recovery threshold, but no recovery
-email is sent and the two-hour cooldown is preserved.
+email is sent and the two-hour cooldown is preserved. On service startup,
+persisted active alerts are compared with the first available GPU temperature
+sample; alerts already below the recovery threshold are immediately marked
+recovered. Recovered records are immutable and are never changed back to
+active—a later high-temperature event creates a new alert.
 
 To notify selected users when one of their GPU processes ends, list their Linux
 usernames under `process_end_notifications.users`. The process must have run
@@ -126,7 +155,8 @@ Installed paths:
 - Data: `/var/lib/simple-node-sentinel`
 
 The service runs as root but is constrained by systemd hardening. It does not
-use `PrivateDevices`, because NVML needs `/dev/nvidia*`.
+use `PrivateDevices`, because NVML monitoring and fan control need
+`/dev/nvidia*`.
 
 ## Unprivileged development
 
@@ -162,10 +192,12 @@ Open `http://127.0.0.1:18080`.
 
 The dashboard refreshes current values every two seconds. CPU, memory, swap,
 GPU and disk cards include historical curves with 15-minute, 1-hour, 6-hour,
-24-hour and 3-day ranges. Charts are served locally and do not require internet
-access.
+24-hour and 3-day ranges. Each GPU card also has a colored fan whose rotation
+tracks the reported fan percentage. It is green at 60°C and below, transitions
+toward red between 60°C and 90°C, and stays red at 90°C and above. Charts and
+icons are served locally and do not require internet access.
 
-## Read-only API
+## API
 
 - `GET /api/summary`
 - `GET /api/gpus`
@@ -175,19 +207,63 @@ access.
 - `GET /api/alerts`
 - `GET /api/history?range_seconds=3600&max_points=720`
 - `GET /health`
+- `PUT /api/gpus/{gpu_uuid}/fan-control`
 
 The history endpoint accepts 60–259200 seconds and returns at most 1000
-downsampled points per series. There are no POST or control endpoints.
+downsampled points per series. `GET /api/gpus` includes a `fan_control` object
+with `mode`, `target_percent`, `revision`, `manual_allowed`, capability and
+error fields.
+
+Use the latest `revision` when changing a fan. For example:
+
+```bash
+curl -X PUT http://127.0.0.1:8080/api/gpus/GPU-UUID/fan-control \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"manual","target_percent":75,"expected_revision":0}'
+
+curl -X PUT http://127.0.0.1:8080/api/gpus/GPU-UUID/fan-control \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"auto","target_percent":null,"expected_revision":1}'
+```
+
+Fan writes are serialized. If two users submit from the same revision, the
+first successful request wins and the other receives HTTP 409 with the newest
+state. A failed NVML call does not update the stored mode or revision.
+
+The last successful mode and target are stored by GPU UUID in SQLite. On
+service or machine restart, the service reads that state and reapplies it after
+the first GPU sample. The idle/low-temperature rule takes priority: a persisted
+manual mode is changed to automatic instead of being restored when the GPU has
+no process and is below the threshold.
+
+## Fan-control troubleshooting
+
+An unavailable control is shown directly on the GPU card and in
+`fan_control_error` from `/health`. Common causes are a GPU without controllable
+fans, a driver that does not export the v2 APIs, or insufficient permissions.
+This implementation calls NVML directly and does not require Xorg, Coolbits,
+`DISPLAY`, `XAUTHORITY`, or `nvidia-settings`.
+
+After installing, verify on one idle-safe GPU from the dashboard or with the
+API. Confirm the reported fan percentage changes, switch back to automatic,
+and check the service log:
+
+```bash
+sudo journalctl -u simple-node-sentinel.service -f
+curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:8080/api/gpus
+```
 
 ## Tests
 
-Tests use mocks for NVML, SMTP and process edge cases. SQLite tests use only an
-automatically removed temporary directory:
+Tests use mocks for NVML fan writes, concurrency, restart/idle policy, SMTP and
+process edge cases. SQLite tests use only an automatically removed temporary
+directory and never change real fan settings:
 
 ```bash
 conda run -n test python -m unittest discover -s tests -v
 ```
 
 Production checks that require an administrator and real hardware should cover
-cross-user `/proc` visibility, sensor labels, NVML values, SMTP delivery and
-the final systemd sandbox.
+cross-user `/proc` visibility, sensor labels, NVML values and fan writes, idle
+automatic restoration, SMTP delivery and the final systemd sandbox.

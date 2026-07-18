@@ -21,6 +21,15 @@ class DatabaseConfig:
 
 
 @dataclass(frozen=True)
+class FanControlConfig:
+    enabled: bool = True
+    minimum_percent: int = 60
+    maximum_percent: int = 90
+    step_percent: int = 5
+    idle_temperature_celsius: float = 60.0
+
+
+@dataclass(frozen=True)
 class AlertConfig:
     high_temperature_celsius: float = 85.0
     high_duration_seconds: float = 300.0
@@ -57,6 +66,7 @@ class ProcessEndNotificationConfig:
 class Config:
     collection: CollectionConfig = field(default_factory=CollectionConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    fan_control: FanControlConfig = field(default_factory=FanControlConfig)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     email: EmailConfig = field(default_factory=EmailConfig)
     users: dict[str, UserConfig] = field(default_factory=dict)
@@ -86,6 +96,9 @@ def load_config(path: str | Path) -> Config:
 
     collection = CollectionConfig(**_mapping(root.get("collection"), "collection"))
     database = DatabaseConfig(**_mapping(root.get("database"), "database"))
+    fan_control = FanControlConfig(
+        **_mapping(root.get("fan_control"), "fan_control")
+    )
     alerts = AlertConfig(**_mapping(root.get("alerts"), "alerts"))
     email_raw = _mapping(root.get("email"), "email").copy()
     email_raw["admin_emails"] = tuple(email_raw.get("admin_emails") or ())
@@ -103,6 +116,7 @@ def load_config(path: str | Path) -> Config:
     config = Config(
         collection=collection,
         database=database,
+        fan_control=fan_control,
         alerts=alerts,
         email=email,
         users=users,
@@ -122,6 +136,23 @@ def validate_config(config: Config) -> None:
     _positive(
         config.database.cleanup_interval_seconds,
         "database.cleanup_interval_seconds",
+    )
+    if not 0 <= config.fan_control.minimum_percent <= 100:
+        raise ValueError("fan_control.minimum_percent must be between 0 and 100")
+    if not 0 <= config.fan_control.maximum_percent <= 100:
+        raise ValueError("fan_control.maximum_percent must be between 0 and 100")
+    if config.fan_control.minimum_percent >= config.fan_control.maximum_percent:
+        raise ValueError(
+            "fan_control.minimum_percent must be below maximum_percent"
+        )
+    _positive(config.fan_control.step_percent, "fan_control.step_percent")
+    if (
+        config.fan_control.maximum_percent - config.fan_control.minimum_percent
+    ) % config.fan_control.step_percent:
+        raise ValueError("fan control range must be divisible by step_percent")
+    _positive(
+        config.fan_control.idle_temperature_celsius,
+        "fan_control.idle_temperature_celsius",
     )
     _positive(config.alerts.high_duration_seconds, "alerts.high_duration_seconds")
     _positive(config.alerts.recovery_duration_seconds, "alerts.recovery_duration_seconds")
