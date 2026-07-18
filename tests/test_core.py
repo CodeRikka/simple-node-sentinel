@@ -173,7 +173,17 @@ class FanControlServiceTests(unittest.TestCase):
                 "process_count": 0,
                 "temperature_celsius": 55,
             }
-            service._refresh_fan_controls([gpu])
+            service._refresh_fan_controls([gpu], monotonic_now=100)
+            state = service.database.get_fan_control_state("GPU-1")
+            self.assertEqual(state["mode"], "manual")
+            self.assertTrue(gpu["fan_control"]["idle_pending"])
+            self.assertFalse(gpu["fan_control"]["idle_locked"])
+            service._refresh_fan_controls([gpu], monotonic_now=119)
+            self.assertEqual(
+                service.database.get_fan_control_state("GPU-1")["mode"],
+                "manual",
+            )
+            service._refresh_fan_controls([gpu], monotonic_now=120)
             state = service.database.get_fan_control_state("GPU-1")
             self.assertEqual(state["mode"], "auto")
             self.assertTrue(gpu["fan_control"]["idle_locked"])
@@ -181,10 +191,50 @@ class FanControlServiceTests(unittest.TestCase):
             service.fan_controller.set_auto.assert_called_once_with("GPU-1")
 
             gpu["process_count"] = 1
-            service._refresh_fan_controls([gpu])
+            service._refresh_fan_controls([gpu], monotonic_now=121)
             self.assertFalse(gpu["fan_control"]["idle_locked"])
             self.assertTrue(gpu["fan_control"]["manual_allowed"])
             self.assertEqual(gpu["fan_control"]["mode"], "auto")
+        finally:
+            service.database.close()
+
+    def test_high_temperature_enforces_eighty_percent_manual_fan(self) -> None:
+        service = self.make_service()
+        try:
+            service.database.ensure_fan_control_state("GPU-1")
+            gpu = {
+                "uuid": "GPU-1",
+                "process_count": 1,
+                "temperature_celsius": 84,
+                "fan_percent": 70,
+            }
+            service._refresh_fan_controls([gpu], monotonic_now=100)
+            state = service.database.get_fan_control_state("GPU-1")
+            self.assertEqual(state["mode"], "manual")
+            self.assertEqual(state["target_percent"], 80)
+            self.assertEqual(state["revision"], 1)
+            service.fan_controller.set_manual.assert_called_once_with("GPU-1", 80)
+        finally:
+            service.database.close()
+
+    def test_emergency_policy_does_not_reduce_higher_manual_target(self) -> None:
+        service = self.make_service()
+        try:
+            state = service.database.ensure_fan_control_state("GPU-1")
+            service.database.update_fan_control_state(
+                "GPU-1", "manual", 90, state["revision"]
+            )
+            gpu = {
+                "uuid": "GPU-1",
+                "process_count": 1,
+                "temperature_celsius": 84,
+                "fan_percent": 70,
+            }
+            service._refresh_fan_controls([gpu], monotonic_now=100)
+            state = service.database.get_fan_control_state("GPU-1")
+            self.assertEqual(state["target_percent"], 90)
+            self.assertEqual(state["revision"], 1)
+            service.fan_controller.set_manual.assert_called_once_with("GPU-1", 90)
         finally:
             service.database.close()
 

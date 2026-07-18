@@ -27,6 +27,9 @@ class FanControlConfig:
     maximum_percent: int = 90
     step_percent: int = 5
     idle_temperature_celsius: float = 60.0
+    idle_duration_seconds: float = 20.0
+    emergency_temperature_celsius: float = 83.0
+    emergency_fan_percent: int = 80
 
 
 @dataclass(frozen=True)
@@ -154,6 +157,29 @@ def validate_config(config: Config) -> None:
         config.fan_control.idle_temperature_celsius,
         "fan_control.idle_temperature_celsius",
     )
+    _positive(
+        config.fan_control.idle_duration_seconds,
+        "fan_control.idle_duration_seconds",
+    )
+    if (
+        config.fan_control.emergency_temperature_celsius
+        <= config.fan_control.idle_temperature_celsius
+    ):
+        raise ValueError(
+            "fan_control.emergency_temperature_celsius must exceed "
+            "idle_temperature_celsius"
+        )
+    emergency_fan = config.fan_control.emergency_fan_percent
+    if (
+        emergency_fan < config.fan_control.minimum_percent
+        or emergency_fan > config.fan_control.maximum_percent
+        or (
+            emergency_fan - config.fan_control.minimum_percent
+        ) % config.fan_control.step_percent
+    ):
+        raise ValueError(
+            "fan_control.emergency_fan_percent must be an allowed manual step"
+        )
     _positive(config.alerts.high_duration_seconds, "alerts.high_duration_seconds")
     _positive(config.alerts.recovery_duration_seconds, "alerts.recovery_duration_seconds")
     _positive(

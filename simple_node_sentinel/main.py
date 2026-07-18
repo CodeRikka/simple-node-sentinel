@@ -109,7 +109,7 @@ class SentinelService:
     def collect_once(self) -> None:
         monotonic_now = time.monotonic()
         gpus, raw_gpu_processes = self.gpu_monitor.collect()
-        self._refresh_fan_controls(gpus)
+        self._refresh_fan_controls(gpus, monotonic_now)
         gpu_processes = self.process_monitor.inspect_gpu_processes(
             raw_gpu_processes
         )
@@ -177,12 +177,14 @@ class SentinelService:
                 "supported": False,
                 "error": "Fan control is disabled by configuration",
                 "idle_locked": False,
+                "idle_since": None,
             }
         elif not self.fan_controller.initialized:
             runtime = {
                 "supported": False,
                 "error": self.fan_controller.last_error or "Fan control is unavailable",
                 "idle_locked": False,
+                "idle_since": None,
             }
         else:
             supported, error = self.fan_controller.supports(gpu_uuid)
@@ -190,6 +192,7 @@ class SentinelService:
                 "supported": supported,
                 "error": error,
                 "idle_locked": False,
+                "idle_since": None,
             }
         self._fan_runtime[gpu_uuid] = runtime
         return runtime
@@ -207,6 +210,9 @@ class SentinelService:
             "revision": state["revision"],
             "manual_allowed": bool(runtime["supported"]) and not idle_locked,
             "idle_locked": idle_locked,
+            "idle_pending": bool(runtime.get("idle_pending")),
+            "idle_remaining_seconds": runtime.get("idle_remaining_seconds"),
+            "emergency_active": bool(runtime.get("emergency_active")),
             "error": runtime.get("error"),
             "minimum_percent": self.config.fan_control.minimum_percent,
             "maximum_percent": self.config.fan_control.maximum_percent,
@@ -214,9 +220,19 @@ class SentinelService:
             "idle_temperature_celsius": (
                 self.config.fan_control.idle_temperature_celsius
             ),
+            "idle_duration_seconds": self.config.fan_control.idle_duration_seconds,
+            "emergency_temperature_celsius": (
+                self.config.fan_control.emergency_temperature_celsius
+            ),
+            "emergency_fan_percent": self.config.fan_control.emergency_fan_percent,
         }
 
-    def _refresh_fan_controls(self, gpus: list[dict[str, Any]]) -> None:
+    def _refresh_fan_controls(
+        self,
+        gpus: list[dict[str, Any]],
+        monotonic_now: float | None = None,
+    ) -> None:
+        now = monotonic_now if monotonic_now is not None else time.monotonic()
         with self._fan_control_lock:
             for gpu in gpus:
                 gpu_uuid = str(gpu["uuid"])
@@ -225,19 +241,100 @@ class SentinelService:
                 runtime = self._runtime_for_gpu(gpu_uuid)
                 control_succeeded = True
                 temperature = gpu.get("temperature_celsius")
+                temperature = float(temperature) if temperature is not None else None
                 process_count = int(gpu.get("process_count") or 0)
                 was_idle_locked = bool(runtime["idle_locked"])
-                if process_count > 0:
-                    idle_locked = False
-                elif temperature is None:
-                    idle_locked = was_idle_locked
-                elif float(temperature) < self.config.fan_control.idle_temperature_celsius:
-                    idle_locked = True
-                elif float(temperature) > self.config.fan_control.idle_temperature_celsius:
-                    idle_locked = False
+                idle_condition = (
+                    process_count == 0
+                    and temperature is not None
+                    and temperature < self.config.fan_control.idle_temperature_celsius
+                )
+                if idle_condition:
+                    idle_since = runtime.get("idle_since")
+                    if idle_since is None:
+                        idle_since = now
+                    runtime["idle_since"] = idle_since
+                    idle_elapsed = max(0.0, now - float(idle_since))
+                    idle_locked = (
+                        was_idle_locked
+                        or idle_elapsed >= self.config.fan_control.idle_duration_seconds
+                    )
+                    runtime["idle_pending"] = not idle_locked
+                    runtime["idle_remaining_seconds"] = max(
+                        0.0,
+                        self.config.fan_control.idle_duration_seconds - idle_elapsed,
+                    )
                 else:
-                    idle_locked = was_idle_locked
+                    runtime["idle_since"] = None
+                    runtime["idle_pending"] = False
+                    runtime["idle_remaining_seconds"] = None
+                    if (
+                        process_count > 0
+                        or (
+                            temperature is not None
+                            and temperature
+                            > self.config.fan_control.idle_temperature_celsius
+                        )
+                    ):
+                        idle_locked = False
+                    else:
+                        idle_locked = was_idle_locked
                 runtime["idle_locked"] = idle_locked
+
+                emergency_applied = False
+                fan_percent = gpu.get("fan_percent")
+                fan_percent = (
+                    float(fan_percent) if fan_percent is not None else None
+                )
+                emergency_target = self.config.fan_control.emergency_fan_percent
+                if state["mode"] == "manual" and state["target_percent"] is not None:
+                    emergency_target = max(
+                        emergency_target, int(state["target_percent"])
+                    )
+                fan_below_emergency = (
+                    fan_percent < self.config.fan_control.emergency_fan_percent
+                    if fan_percent is not None
+                    else (
+                        state["mode"] == "manual"
+                        and (
+                            state["target_percent"] is None
+                            or int(state["target_percent"])
+                            < self.config.fan_control.emergency_fan_percent
+                        )
+                    )
+                )
+                emergency_needed = (
+                    temperature is not None
+                    and temperature
+                    > self.config.fan_control.emergency_temperature_celsius
+                    and (state["mode"] != "manual" or fan_below_emergency)
+                )
+                runtime["emergency_active"] = bool(
+                    temperature is not None
+                    and temperature
+                    > self.config.fan_control.emergency_temperature_celsius
+                )
+                if runtime["supported"] and emergency_needed:
+                    try:
+                        self.fan_controller.set_manual(gpu_uuid, emergency_target)
+                        if (
+                            state["mode"] != "manual"
+                            or state["target_percent"] != emergency_target
+                        ):
+                            updated = self.database.update_fan_control_state(
+                                gpu_uuid,
+                                "manual",
+                                emergency_target,
+                                int(state["revision"]),
+                            )
+                            if updated is not None:
+                                state = updated
+                        runtime["error"] = None
+                        emergency_applied = True
+                    except FanControlError as exc:
+                        control_succeeded = False
+                        runtime["error"] = str(exc)
+                        LOGGER.error("Unable to apply emergency fan speed: %s", exc)
 
                 if (
                     runtime["supported"]
@@ -267,6 +364,7 @@ class SentinelService:
                     and gpu_uuid not in self._fan_restored
                     and existing is not None
                     and not idle_locked
+                    and not emergency_applied
                 ):
                     try:
                         if state["mode"] == "manual":

@@ -353,6 +353,7 @@ select {
   font-size: .68rem;
 }
 .fan-control-message.error { color: #fb7185; }
+.fan-control-message.warning { color: #fbbf24; }
 .panel-empty { grid-column: 1 / -1; padding: 2rem; border: 1px dashed #293749; border-radius: .8rem; }
 .table-wrap {
   overflow-x: auto;

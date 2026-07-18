@@ -281,10 +281,22 @@ function updateFanControl(gpu, overrideMessage = null) {
   if (overrideMessage) {
     nodes.message.textContent = overrideMessage;
     nodes.message.className = "fan-control-message error";
+  } else if (state.emergency_active) {
+    nodes.message.textContent = (
+      `Above ${state.emergency_temperature_celsius ?? 83}°C — `
+      + `high-temperature fan protection is active at ${state.emergency_fan_percent ?? 80}% or higher.`
+    );
+    nodes.message.className = "fan-control-message warning";
   } else if (state.idle_locked) {
     nodes.message.textContent = (
       `Idle below ${state.idle_temperature_celsius ?? 60}°C — `
       + "NVIDIA automatic mode is enforced."
+    );
+    nodes.message.className = "fan-control-message";
+  } else if (state.idle_pending) {
+    nodes.message.textContent = (
+      `Idle below ${state.idle_temperature_celsius ?? 60}°C — automatic mode in `
+      + `${Math.ceil(state.idle_remaining_seconds ?? 0)}s if it remains idle.`
     );
     nodes.message.className = "fan-control-message";
   } else if (!supported) {

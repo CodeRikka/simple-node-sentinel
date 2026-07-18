@@ -21,8 +21,13 @@ fan_control:
   minimum_percent: 60
   maximum_percent: 90
   step_percent: 5
-  # An idle GPU below this temperature is forced back to NVIDIA automatic mode.
+  # An idle GPU must remain below this temperature for the full duration
+  # before it is forced back to NVIDIA automatic mode.
   idle_temperature_celsius: 60
+  idle_duration_seconds: 20
+  # A hot GPU is forced to at least this manual fan target.
+  emergency_temperature_celsius: 83
+  emergency_fan_percent: 80
 
 alerts:
   high_temperature_celsius: 85

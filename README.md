@@ -82,10 +82,13 @@ choosing a longer retention period.
 
 `fan_control` enables the dashboard controls and defines the allowed manual
 range. The supplied configuration allows 60–90% in 5% steps. When a GPU has no
-NVML compute processes and its temperature is below 60°C, the service restores
-NVIDIA automatic fan control and temporarily disables manual mode. Manual mode
-becomes available again when a process appears or the temperature rises above
-60°C; it is not automatically re-enabled.
+NVML compute processes and remains below 60°C continuously for 20 seconds, the
+service restores NVIDIA automatic fan control and temporarily disables manual
+mode. Manual mode becomes available again when a process appears or the
+temperature rises above 60°C; it is not automatically re-enabled. If a GPU
+rises above 83°C while it is not in manual mode or its reported fan speed is
+below 80%, the service immediately enables manual control at 80%. An existing
+manual target above 80% is preserved rather than reduced.
 
 ```yaml
 fan_control:
@@ -94,6 +97,9 @@ fan_control:
   maximum_percent: 90
   step_percent: 5
   idle_temperature_celsius: 60
+  idle_duration_seconds: 20
+  emergency_temperature_celsius: 83
+  emergency_fan_percent: 80
 ```
 
 Fan control has no separate login or administrator role. Every user who can
@@ -232,9 +238,10 @@ state. A failed NVML call does not update the stored mode or revision.
 
 The last successful mode and target are stored by GPU UUID in SQLite. On
 service or machine restart, the service reads that state and reapplies it after
-the first GPU sample. The idle/low-temperature rule takes priority: a persisted
-manual mode is changed to automatic instead of being restored when the GPU has
-no process and is below the threshold.
+the first GPU sample. A persisted manual mode remains active during the
+20-second idle/low-temperature confirmation window, then changes to automatic
+if the condition remains true. The high-temperature rule takes priority and
+can immediately replace an automatic or insufficient manual setting.
 
 ## Fan-control troubleshooting
 
