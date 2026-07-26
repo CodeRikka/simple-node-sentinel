@@ -14,12 +14,13 @@ from users. Fan changes use a fixed NVML API with validated values.
 - GPU process owner, sanitized command, runtime, CPU, RAM and GPU memory
 - Per-user process, CPU, RAM and GPU totals
 - Sustained GPU temperature alerts and optional SMTP delivery
-- Per-GPU NVIDIA automatic or 60–90% manual fan control
+- Per-GPU temperature→fan curves stored in SQLite and edited in the dashboard
 
 The latest snapshot stays in memory for fast live updates. SQLite also stores
 system, GPU and disk metric history, GPU process lifetimes, temperature alert
-events and email delivery records. Metric history is retained for three days by
-default and is downsampled by the API before it reaches the browser.
+events, email delivery records, synced user notification settings and per-GPU
+fan profiles. Metric history is retained for three days by default and is
+downsampled by the API before it reaches the browser.
 
 ## Requirements
 
@@ -62,8 +63,16 @@ sudoedit /etc/simple-node-sentinel/smtp-password
 ```
 
 The password file must contain only the SMTP password or app password, with no
-quotes. User email addresses are never guessed; add explicit entries under
-`users`. Users without mappings are named in the administrator notification.
+quotes. User emails, admin flags and process-end notification toggles are
+stored in the database and edited under **User settings** in the dashboard.
+Linux login users (`UID >= UID_MIN`, plus root) are synced automatically on
+startup and every six hours; the dashboard can also sync on demand. Users
+without an email are named in temperature-alert bodies when they are missing.
+
+Older YAML keys (`users`, `email.admin_emails`,
+`process_end_notifications.users`, and the old global fan thresholds) are
+ignored for runtime configuration. On first start after an upgrade they are
+imported once into the database when still present.
 
 Configuration is read at process start. After editing `config.yaml` or the
 SMTP password file, restart the service (no need to rerun `install.sh`):
@@ -80,48 +89,42 @@ records. At the default two-second collection interval, multi-GPU nodes can use
 several hundred MiB for three days of history; monitor the database file when
 choosing a longer retention period.
 
-`fan_control` enables the dashboard controls and defines the allowed manual
-range. The supplied configuration allows 60–90% in 5% steps. When a GPU has no
-NVML compute processes and remains below 60°C continuously for 20 seconds, the
-service restores NVIDIA automatic fan control and temporarily disables manual
-mode. Manual mode becomes available again when a process appears or the
-temperature rises above 60°C; it is not automatically re-enabled. If a GPU
-rises above 83°C while it is not in manual mode or its reported fan speed is
-below 80%, the service immediately enables manual control at 80%. An existing
-manual target above 80% is preserved rather than reduced.
+`fan_control` enables dashboard curve editing and NVML writes. Only the global
+feature switch and UI/write step size remain in YAML:
 
 ```yaml
 fan_control:
   enabled: true
-  minimum_percent: 60
-  maximum_percent: 90
   step_percent: 5
-  idle_temperature_celsius: 60
-  idle_duration_seconds: 20
-  emergency_temperature_celsius: 83
-  emergency_fan_percent: 80
 ```
 
-Fan control has no separate login or administrator role. Every user who can
-reach the dashboard can change it. Keep the service bound to localhost and
-grant SSH access only to trusted users. Set `fan_control.enabled: false` to
-retain a read-only deployment.
+Each GPU gets its own persisted profile the first time it is observed: min/max
+fan percents, idle temperature/duration, and a default curve point of
+`80°C → 80%`. While the curve has points, the service applies the highest
+triggered fan target and only ratchets upward until the GPU is idle below the
+idle temperature for the configured duration, then restores NVIDIA automatic
+mode. Deleting every curve point leaves the GPU in automatic mode.
+
+Fan and user settings have no separate login. Everyone who can reach the
+dashboard can change them. Keep the service bound to localhost and grant SSH
+access only to trusted users. Set `fan_control.enabled: false` to retain a
+read-only deployment for fans.
 
 Temperature alerts are sent after five continuous minutes above the configured
-threshold, with at most one alert per GPU every two hours. Recovery is recorded
-after five continuous minutes below the recovery threshold, but no recovery
-email is sent and the two-hour cooldown is preserved. On service startup,
-persisted active alerts are compared with the first available GPU temperature
-sample; alerts already below the recovery threshold are immediately marked
-recovered. Recovered records are immutable and are never changed back to
-active—a later high-temperature event creates a new alert.
+threshold, with at most one alert per GPU every two hours. Recipients are
+active users marked `is_admin`, plus GPU occupants who have
+`notify_temperature` and an email. Recovery is recorded after five continuous
+minutes below the recovery threshold, but no recovery email is sent and the
+two-hour cooldown is preserved. On service startup, persisted active alerts are
+compared with the first available GPU temperature sample; alerts already below
+the recovery threshold are immediately marked recovered. Recovered records are
+immutable and are never changed back to active—a later high-temperature event
+creates a new alert.
 
-To notify selected users when one of their GPU processes ends, list their Linux
-usernames under `process_end_notifications.users`. The process must have run
-for at least `min_runtime_seconds` (default five minutes), then be absent from
-NVML for `missing_duration_seconds` (default 20 seconds) before the user is
-emailed. Short-lived processes are ignored. These notifications go only to the
-affected user, not to administrators.
+Process-end emails go only to users with `notify_process_end` enabled. The
+process must have run for at least `min_runtime_seconds` (default five minutes),
+then be absent from NVML for `missing_duration_seconds` (default 20 seconds).
+Short-lived processes are ignored.
 
 ## Production installation
 
@@ -198,10 +201,10 @@ Open `http://127.0.0.1:18080`.
 
 The dashboard refreshes current values every two seconds. CPU, memory, swap,
 GPU and disk cards include historical curves with 15-minute, 1-hour, 6-hour,
-24-hour and 3-day ranges. Each GPU card also has a colored fan whose rotation
-tracks the reported fan percentage. It is green at 60°C and below, transitions
-toward red between 60°C and 90°C, and stays red at 90°C and above. Charts and
-icons are served locally and do not require internet access.
+24-hour and 3-day ranges. Each GPU card edits its own fan curve with a live
+preview. The animated fan icon is green at 60°C and below, transitions toward
+red between 60°C and 90°C, and stays red at 90°C and above. Charts and icons
+are served locally and do not require internet access.
 
 ## API
 
@@ -209,39 +212,39 @@ icons are served locally and do not require internet access.
 - `GET /api/gpus`
 - `GET /api/gpu-processes`
 - `GET /api/users`
+- `GET /api/settings/users`
+- `POST /api/settings/users/sync`
+- `PATCH /api/settings/users/{username}`
 - `GET /api/disks`
 - `GET /api/alerts`
 - `GET /api/history?range_seconds=3600&max_points=720`
 - `GET /health`
-- `PUT /api/gpus/{gpu_uuid}/fan-control`
+- `PUT /api/gpus/{gpu_uuid}/fan-profile`
 
 The history endpoint accepts 60–259200 seconds and returns at most 1000
 downsampled points per series. `GET /api/gpus` includes a `fan_control` object
-with `mode`, `target_percent`, `revision`, `manual_allowed`, capability and
-error fields.
+with profile limits, `curve_points`, `mode` (`auto` when empty, otherwise
+`curve`), `applied_percent`, `revision`, capability and error fields.
 
-Use the latest `revision` when changing a fan. For example:
+Use the latest `revision` when saving a fan profile. For example:
 
 ```bash
-curl -X PUT http://127.0.0.1:8080/api/gpus/GPU-UUID/fan-control \
+curl -X PUT http://127.0.0.1:8080/api/gpus/GPU-UUID/fan-profile \
   -H 'Content-Type: application/json' \
-  -d '{"mode":"manual","target_percent":75,"expected_revision":0}'
-
-curl -X PUT http://127.0.0.1:8080/api/gpus/GPU-UUID/fan-control \
-  -H 'Content-Type: application/json' \
-  -d '{"mode":"auto","target_percent":null,"expected_revision":1}'
+  -d '{
+    "minimum_percent": 30,
+    "maximum_percent": 100,
+    "idle_temperature_celsius": 60,
+    "idle_duration_seconds": 20,
+    "curve_points": [{"temperature_celsius": 80, "fan_percent": 80}],
+    "expected_revision": 0
+  }'
 ```
 
-Fan writes are serialized. If two users submit from the same revision, the
-first successful request wins and the other receives HTTP 409 with the newest
-state. A failed NVML call does not update the stored mode or revision.
-
-The last successful mode and target are stored by GPU UUID in SQLite. On
-service or machine restart, the service reads that state and reapplies it after
-the first GPU sample. A persisted manual mode remains active during the
-20-second idle/low-temperature confirmation window, then changes to automatic
-if the condition remains true. The high-temperature rule takes priority and
-can immediately replace an automatic or insufficient manual setting.
+Fan profile writes are serialized. If two users submit from the same revision,
+the first successful request wins and the other receives HTTP 409 with the
+newest state. An empty `curve_points` list switches the GPU to NVIDIA automatic
+mode.
 
 ## Fan-control troubleshooting
 

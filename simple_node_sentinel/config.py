@@ -23,13 +23,7 @@ class DatabaseConfig:
 @dataclass(frozen=True)
 class FanControlConfig:
     enabled: bool = True
-    minimum_percent: int = 60
-    maximum_percent: int = 90
     step_percent: int = 5
-    idle_temperature_celsius: float = 60.0
-    idle_duration_seconds: float = 20.0
-    emergency_temperature_celsius: float = 83.0
-    emergency_fan_percent: int = 80
 
 
 @dataclass(frozen=True)
@@ -50,19 +44,21 @@ class EmailConfig:
     username: str = ""
     password_file: str = ""
     from_address: str = ""
-    admin_emails: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class UserConfig:
-    email: str | None = None
 
 
 @dataclass(frozen=True)
 class ProcessEndNotificationConfig:
-    users: tuple[str, ...] = ()
     missing_duration_seconds: float = 20.0
     min_runtime_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
+class LegacyImport:
+    """One-time values read from older YAML layouts."""
+
+    users: dict[str, str] = field(default_factory=dict)
+    admin_emails: tuple[str, ...] = ()
+    process_end_users: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -72,10 +68,10 @@ class Config:
     fan_control: FanControlConfig = field(default_factory=FanControlConfig)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     email: EmailConfig = field(default_factory=EmailConfig)
-    users: dict[str, UserConfig] = field(default_factory=dict)
     process_end_notifications: ProcessEndNotificationConfig = field(
         default_factory=ProcessEndNotificationConfig
     )
+    legacy_import: LegacyImport | None = None
 
 
 def _mapping(value: Any, name: str) -> dict[str, Any]:
@@ -91,6 +87,36 @@ def _positive(value: float | int, name: str) -> None:
         raise ValueError(f"{name} must be greater than zero")
 
 
+def _extract_legacy(root: dict[str, Any]) -> LegacyImport | None:
+    users_raw = _mapping(root.get("users"), "users")
+    users = {
+        str(name): str(settings.get("email") or "").strip()
+        for name, settings in users_raw.items()
+        if isinstance(settings, dict) and settings.get("email")
+    }
+    email_raw = _mapping(root.get("email"), "email")
+    admin_emails = tuple(
+        str(item).strip()
+        for item in (email_raw.get("admin_emails") or ())
+        if str(item).strip()
+    )
+    process_end_raw = _mapping(
+        root.get("process_end_notifications"), "process_end_notifications"
+    )
+    process_end_users = tuple(
+        str(item).strip()
+        for item in (process_end_raw.get("users") or ())
+        if str(item).strip()
+    )
+    if not users and not admin_emails and not process_end_users:
+        return None
+    return LegacyImport(
+        users=users,
+        admin_emails=admin_emails,
+        process_end_users=process_end_users,
+    )
+
+
 def load_config(path: str | Path) -> Config:
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
@@ -99,31 +125,38 @@ def load_config(path: str | Path) -> Config:
 
     collection = CollectionConfig(**_mapping(root.get("collection"), "collection"))
     database = DatabaseConfig(**_mapping(root.get("database"), "database"))
+
+    fan_raw = _mapping(root.get("fan_control"), "fan_control")
     fan_control = FanControlConfig(
-        **_mapping(root.get("fan_control"), "fan_control")
+        enabled=bool(fan_raw.get("enabled", True)),
+        step_percent=int(fan_raw.get("step_percent", 5)),
     )
     alerts = AlertConfig(**_mapping(root.get("alerts"), "alerts"))
-    email_raw = _mapping(root.get("email"), "email").copy()
-    email_raw["admin_emails"] = tuple(email_raw.get("admin_emails") or ())
+
+    email_raw = {
+        key: value
+        for key, value in _mapping(root.get("email"), "email").items()
+        if key != "admin_emails"
+    }
     email = EmailConfig(**email_raw)
 
-    users = {
-        str(name): UserConfig(**_mapping(settings, f"users.{name}"))
-        for name, settings in _mapping(root.get("users"), "users").items()
+    process_end_raw = {
+        key: value
+        for key, value in _mapping(
+            root.get("process_end_notifications"), "process_end_notifications"
+        ).items()
+        if key != "users"
     }
-    process_end_raw = _mapping(
-        root.get("process_end_notifications"), "process_end_notifications"
-    ).copy()
-    process_end_raw["users"] = tuple(process_end_raw.get("users") or ())
     process_end_notifications = ProcessEndNotificationConfig(**process_end_raw)
+
     config = Config(
         collection=collection,
         database=database,
         fan_control=fan_control,
         alerts=alerts,
         email=email,
-        users=users,
         process_end_notifications=process_end_notifications,
+        legacy_import=_extract_legacy(root),
     )
     validate_config(config)
     return config
@@ -140,46 +173,9 @@ def validate_config(config: Config) -> None:
         config.database.cleanup_interval_seconds,
         "database.cleanup_interval_seconds",
     )
-    if not 0 <= config.fan_control.minimum_percent <= 100:
-        raise ValueError("fan_control.minimum_percent must be between 0 and 100")
-    if not 0 <= config.fan_control.maximum_percent <= 100:
-        raise ValueError("fan_control.maximum_percent must be between 0 and 100")
-    if config.fan_control.minimum_percent >= config.fan_control.maximum_percent:
-        raise ValueError(
-            "fan_control.minimum_percent must be below maximum_percent"
-        )
     _positive(config.fan_control.step_percent, "fan_control.step_percent")
-    if (
-        config.fan_control.maximum_percent - config.fan_control.minimum_percent
-    ) % config.fan_control.step_percent:
-        raise ValueError("fan control range must be divisible by step_percent")
-    _positive(
-        config.fan_control.idle_temperature_celsius,
-        "fan_control.idle_temperature_celsius",
-    )
-    _positive(
-        config.fan_control.idle_duration_seconds,
-        "fan_control.idle_duration_seconds",
-    )
-    if (
-        config.fan_control.emergency_temperature_celsius
-        <= config.fan_control.idle_temperature_celsius
-    ):
-        raise ValueError(
-            "fan_control.emergency_temperature_celsius must exceed "
-            "idle_temperature_celsius"
-        )
-    emergency_fan = config.fan_control.emergency_fan_percent
-    if (
-        emergency_fan < config.fan_control.minimum_percent
-        or emergency_fan > config.fan_control.maximum_percent
-        or (
-            emergency_fan - config.fan_control.minimum_percent
-        ) % config.fan_control.step_percent
-    ):
-        raise ValueError(
-            "fan_control.emergency_fan_percent must be an allowed manual step"
-        )
+    if config.fan_control.step_percent > 100:
+        raise ValueError("fan_control.step_percent must be between 1 and 100")
     _positive(config.alerts.high_duration_seconds, "alerts.high_duration_seconds")
     _positive(config.alerts.recovery_duration_seconds, "alerts.recovery_duration_seconds")
     _positive(

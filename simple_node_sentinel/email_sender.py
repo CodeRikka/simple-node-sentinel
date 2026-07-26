@@ -5,29 +5,45 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
-from .config import EmailConfig, UserConfig
+from .config import EmailConfig
+from .database import Database
 
 LOGGER = logging.getLogger(__name__)
 
+NotifyKind = Literal["temperature", "process_end"]
+
 
 class EmailSender:
-    def __init__(
-        self, config: EmailConfig, users: dict[str, UserConfig]
-    ) -> None:
+    def __init__(self, config: EmailConfig, database: Database) -> None:
         self.config = config
-        self.users = users
+        self.database = database
 
     def recipients_for(
-        self, usernames: Iterable[str], include_admins: bool = True
+        self,
+        usernames: Iterable[str],
+        *,
+        include_admins: bool = True,
+        notify: NotifyKind | None = None,
     ) -> tuple[list[str], list[str]]:
-        recipients = set(self.config.admin_emails) if include_admins else set()
+        recipients: set[str] = set()
+        if include_admins:
+            recipients.update(self.database.admin_emails())
+
         missing: list[str] = []
         for username in sorted(set(usernames)):
-            user = self.users.get(username)
-            if user is not None and user.email:
-                recipients.add(user.email)
+            user = self.database.get_user_setting(username)
+            if user is None or not user.get("active"):
+                missing.append(username)
+                continue
+            if notify == "temperature" and not user.get("notify_temperature"):
+                continue
+            if notify == "process_end" and not user.get("notify_process_end"):
+                continue
+            email = (user.get("email") or "").strip()
+            if email:
+                recipients.add(email)
             else:
                 missing.append(username)
         return sorted(recipients), missing
@@ -37,9 +53,13 @@ class EmailSender:
         subject: str,
         body: str,
         usernames: Iterable[str],
+        *,
         include_admins: bool = True,
+        notify: NotifyKind | None = None,
     ) -> tuple[str, list[str], str | None]:
-        recipients, missing = self.recipients_for(usernames, include_admins)
+        recipients, missing = self.recipients_for(
+            usernames, include_admins=include_admins, notify=notify
+        )
         if missing:
             body += "\n\nNo configured email address for: " + ", ".join(missing)
         if not self.config.enabled:

@@ -95,7 +95,7 @@ class AlertManager:
                 f"Maximum observed temperature is {state.max_temperature:.1f}°C."
             )
         status, recipients, error = self.email_sender.send(
-            subject, body, state.users
+            subject, body, state.users, notify="temperature"
         )
         self.database.record_email(
             state.alert_id, kind, recipients, status, error

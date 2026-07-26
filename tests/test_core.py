@@ -18,7 +18,6 @@ from simple_node_sentinel.config import (
     EmailConfig,
     FanControlConfig,
     ProcessEndNotificationConfig,
-    UserConfig,
     load_config,
 )
 from simple_node_sentinel.database import Database
@@ -27,7 +26,12 @@ from simple_node_sentinel.gpu_fan_controller import (
     FanControlError,
     GpuFanController,
 )
-from simple_node_sentinel.main import SentinelService, create_app
+from simple_node_sentinel.main import (
+    FanProfileRequest,
+    FanCurvePointModel,
+    SentinelService,
+    create_app,
+)
 from simple_node_sentinel.process_end_manager import ProcessEndManager
 from simple_node_sentinel.process_monitor import (
     ProcessMonitor,
@@ -96,6 +100,36 @@ class ConfigTests(unittest.TestCase):
             config = load_config(path)
             self.assertEqual(config.database.retention_days, 3)
             self.assertFalse(config.email.enabled)
+            self.assertEqual(config.fan_control.step_percent, 5)
+
+    def test_extracts_legacy_user_fields_without_requiring_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "database:\n"
+                f"  path: {directory}/sentinel.db\n"
+                "email:\n"
+                "  enabled: false\n"
+                "  admin_emails:\n"
+                "    - admin@example.com\n"
+                "users:\n"
+                "  alice:\n"
+                "    email: alice@example.com\n"
+                "process_end_notifications:\n"
+                "  users:\n"
+                "    - alice\n",
+                encoding="utf-8",
+            )
+            config = load_config(path)
+            self.assertIsNotNone(config.legacy_import)
+            assert config.legacy_import is not None
+            self.assertEqual(
+                config.legacy_import.users, {"alice": "alice@example.com"}
+            )
+            self.assertEqual(
+                config.legacy_import.admin_emails, ("admin@example.com",)
+            )
+            self.assertEqual(config.legacy_import.process_end_users, ("alice",))
 
     def test_rejects_relative_database_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -161,80 +195,98 @@ class FanControlServiceTests(unittest.TestCase):
         service.fan_controller.set_manual = Mock()
         return service
 
+    def test_default_profile_seeds_eighty_degree_curve(self) -> None:
+        service = self.make_service()
+        try:
+            profile = service.database.ensure_fan_profile("GPU-1")
+            self.assertEqual(
+                profile["curve_points"],
+                [{"temperature_celsius": 80.0, "fan_percent": 80}],
+            )
+            self.assertEqual(profile["mode"], "curve")
+        finally:
+            service.database.close()
+
     def test_idle_low_temperature_forces_auto_and_unlocks_on_process(self) -> None:
         service = self.make_service()
         try:
-            state = service.database.ensure_fan_control_state("GPU-1")
-            service.database.update_fan_control_state(
-                "GPU-1", "manual", 80, state["revision"]
-            )
+            service.database.ensure_fan_profile("GPU-1")
             gpu = {
                 "uuid": "GPU-1",
                 "process_count": 0,
                 "temperature_celsius": 55,
             }
             service._refresh_fan_controls([gpu], monotonic_now=100)
-            state = service.database.get_fan_control_state("GPU-1")
-            self.assertEqual(state["mode"], "manual")
             self.assertTrue(gpu["fan_control"]["idle_pending"])
             self.assertFalse(gpu["fan_control"]["idle_locked"])
-            service._refresh_fan_controls([gpu], monotonic_now=119)
-            self.assertEqual(
-                service.database.get_fan_control_state("GPU-1")["mode"],
-                "manual",
-            )
             service._refresh_fan_controls([gpu], monotonic_now=120)
-            state = service.database.get_fan_control_state("GPU-1")
-            self.assertEqual(state["mode"], "auto")
             self.assertTrue(gpu["fan_control"]["idle_locked"])
-            self.assertFalse(gpu["fan_control"]["manual_allowed"])
-            service.fan_controller.set_auto.assert_called_once_with("GPU-1")
+            self.assertEqual(gpu["fan_control"]["mode"], "curve")
+            service.fan_controller.set_auto.assert_called_with("GPU-1")
 
             gpu["process_count"] = 1
+            gpu["temperature_celsius"] = 81
             service._refresh_fan_controls([gpu], monotonic_now=121)
             self.assertFalse(gpu["fan_control"]["idle_locked"])
-            self.assertTrue(gpu["fan_control"]["manual_allowed"])
-            self.assertEqual(gpu["fan_control"]["mode"], "auto")
+            self.assertEqual(gpu["fan_control"]["applied_percent"], 80)
+            service.fan_controller.set_manual.assert_called_with("GPU-1", 80)
         finally:
             service.database.close()
 
-    def test_high_temperature_enforces_eighty_percent_manual_fan(self) -> None:
+    def test_curve_ratchets_up_and_does_not_lower(self) -> None:
         service = self.make_service()
         try:
-            service.database.ensure_fan_control_state("GPU-1")
-            gpu = {
-                "uuid": "GPU-1",
-                "process_count": 1,
-                "temperature_celsius": 84,
-                "fan_percent": 70,
-            }
-            service._refresh_fan_controls([gpu], monotonic_now=100)
-            state = service.database.get_fan_control_state("GPU-1")
-            self.assertEqual(state["mode"], "manual")
-            self.assertEqual(state["target_percent"], 80)
-            self.assertEqual(state["revision"], 1)
-            service.fan_controller.set_manual.assert_called_once_with("GPU-1", 80)
-        finally:
-            service.database.close()
-
-    def test_emergency_policy_does_not_reduce_higher_manual_target(self) -> None:
-        service = self.make_service()
-        try:
-            state = service.database.ensure_fan_control_state("GPU-1")
-            service.database.update_fan_control_state(
-                "GPU-1", "manual", 90, state["revision"]
+            profile = service.database.ensure_fan_profile("GPU-1")
+            service.database.update_fan_profile(
+                "GPU-1",
+                minimum_percent=30,
+                maximum_percent=100,
+                idle_temperature_celsius=60,
+                idle_duration_seconds=20,
+                curve_points=[
+                    {"temperature_celsius": 70, "fan_percent": 70},
+                    {"temperature_celsius": 80, "fan_percent": 80},
+                ],
+                expected_revision=profile["revision"],
             )
             gpu = {
                 "uuid": "GPU-1",
                 "process_count": 1,
-                "temperature_celsius": 84,
-                "fan_percent": 70,
+                "temperature_celsius": 81,
             }
             service._refresh_fan_controls([gpu], monotonic_now=100)
-            state = service.database.get_fan_control_state("GPU-1")
-            self.assertEqual(state["target_percent"], 90)
-            self.assertEqual(state["revision"], 1)
-            service.fan_controller.set_manual.assert_called_once_with("GPU-1", 90)
+            self.assertEqual(gpu["fan_control"]["applied_percent"], 80)
+            gpu["temperature_celsius"] = 71
+            service._refresh_fan_controls([gpu], monotonic_now=101)
+            self.assertEqual(gpu["fan_control"]["applied_percent"], 80)
+        finally:
+            service.database.close()
+
+    def test_empty_curve_uses_automatic_mode(self) -> None:
+        service = self.make_service()
+        try:
+            profile = service.database.ensure_fan_profile("GPU-1")
+            updated = service.set_fan_profile(
+                "GPU-1",
+                FanProfileRequest(
+                    minimum_percent=30,
+                    maximum_percent=100,
+                    idle_temperature_celsius=60,
+                    idle_duration_seconds=20,
+                    curve_points=[],
+                    expected_revision=profile["revision"],
+                ),
+            )
+            self.assertEqual(updated["mode"], "auto")
+            self.assertEqual(updated["curve_points"], [])
+            service.fan_controller.set_auto.assert_called_with("GPU-1")
+            gpu = {
+                "uuid": "GPU-1",
+                "process_count": 1,
+                "temperature_celsius": 90,
+            }
+            service._refresh_fan_controls([gpu], monotonic_now=100)
+            self.assertIsNone(gpu["fan_control"]["applied_percent"])
         finally:
             service.database.close()
 
@@ -248,88 +300,105 @@ class FanControlServiceTests(unittest.TestCase):
             }
             service._refresh_fan_controls([gpu])
             self.assertFalse(gpu["fan_control"]["idle_locked"])
-            service.fan_controller.set_auto.assert_not_called()
         finally:
             service.database.close()
 
-    def test_persisted_manual_state_is_restored_by_uuid(self) -> None:
+    def test_stale_revision_is_rejected(self) -> None:
         service = self.make_service()
         try:
-            state = service.database.ensure_fan_control_state("GPU-stable")
-            service.database.update_fan_control_state(
-                "GPU-stable", "manual", 85, state["revision"]
+            service.database.ensure_fan_profile("GPU-1")
+            first = service.set_fan_profile(
+                "GPU-1",
+                FanProfileRequest(
+                    minimum_percent=30,
+                    maximum_percent=100,
+                    idle_temperature_celsius=60,
+                    idle_duration_seconds=20,
+                    curve_points=[
+                        FanCurvePointModel(temperature_celsius=80, fan_percent=80)
+                    ],
+                    expected_revision=0,
+                ),
             )
-            service._refresh_fan_controls(
-                [
-                    {
-                        "uuid": "GPU-stable",
-                        "index": 7,
-                        "process_count": 0,
-                        "temperature_celsius": 70,
-                    }
-                ]
-            )
-            service.fan_controller.set_manual.assert_called_once_with(
-                "GPU-stable", 85
-            )
-        finally:
-            service.database.close()
-
-    def test_stale_revision_is_rejected_without_second_hardware_write(self) -> None:
-        service = self.make_service()
-        try:
-            service.database.ensure_fan_control_state("GPU-1")
-            service._fan_runtime["GPU-1"] = {
-                "supported": True,
-                "error": None,
-                "idle_locked": False,
-            }
-            first = service.set_fan_control("GPU-1", "manual", 75, 0)
             self.assertEqual(first["revision"], 1)
             with self.assertRaises(HTTPException) as raised:
-                service.set_fan_control("GPU-1", "manual", 80, 0)
+                service.set_fan_profile(
+                    "GPU-1",
+                    FanProfileRequest(
+                        minimum_percent=30,
+                        maximum_percent=100,
+                        idle_temperature_celsius=60,
+                        idle_duration_seconds=20,
+                        curve_points=[],
+                        expected_revision=0,
+                    ),
+                )
             self.assertEqual(raised.exception.status_code, 409)
-            service.fan_controller.set_manual.assert_called_once_with("GPU-1", 75)
-        finally:
-            service.database.close()
-
-    def test_failed_hardware_write_does_not_change_persisted_state(self) -> None:
-        service = self.make_service()
-        try:
-            service.database.ensure_fan_control_state("GPU-1")
-            service._fan_runtime["GPU-1"] = {
-                "supported": True,
-                "error": None,
-                "idle_locked": False,
-            }
-            service.fan_controller.set_manual.side_effect = FanControlError("failed")
-            with self.assertRaises(HTTPException) as raised:
-                service.set_fan_control("GPU-1", "manual", 75, 0)
-            self.assertEqual(raised.exception.status_code, 503)
-            state = service.database.get_fan_control_state("GPU-1")
-            self.assertEqual(state["mode"], "auto")
-            self.assertEqual(state["revision"], 0)
         finally:
             service.database.close()
 
 
 class DatabaseTests(unittest.TestCase):
-    def test_fan_control_state_uses_revision_and_survives_cleanup(self) -> None:
+    def test_fan_profile_uses_revision_and_survives_cleanup(self) -> None:
         database = Database(":memory:")
         database.open()
         try:
-            initial = database.ensure_fan_control_state("GPU-1")
-            updated = database.update_fan_control_state(
-                "GPU-1", "manual", 75, initial["revision"], updated_at=100
+            initial = database.ensure_fan_profile("GPU-1")
+            updated = database.update_fan_profile(
+                "GPU-1",
+                minimum_percent=40,
+                maximum_percent=100,
+                idle_temperature_celsius=55,
+                idle_duration_seconds=15,
+                curve_points=[{"temperature_celsius": 75, "fan_percent": 70}],
+                expected_revision=initial["revision"],
+                updated_at=100,
             )
             self.assertEqual(updated["revision"], 1)
             self.assertIsNone(
-                database.update_fan_control_state("GPU-1", "manual", 80, 0)
+                database.update_fan_profile(
+                    "GPU-1",
+                    minimum_percent=40,
+                    maximum_percent=100,
+                    idle_temperature_celsius=55,
+                    idle_duration_seconds=15,
+                    curve_points=[],
+                    expected_revision=0,
+                )
             )
             database.cleanup(retention_days=1, now=10 * 86400)
-            persisted = database.get_fan_control_state("GPU-1")
-            self.assertEqual(persisted["mode"], "manual")
-            self.assertEqual(persisted["target_percent"], 75)
+            persisted = database.get_fan_profile("GPU-1")
+            self.assertEqual(persisted["minimum_percent"], 40)
+            self.assertEqual(
+                persisted["curve_points"],
+                [{"temperature_celsius": 75.0, "fan_percent": 70}],
+            )
+        finally:
+            database.close()
+
+    def test_user_settings_sync_and_update(self) -> None:
+        database = Database(":memory:")
+        database.open()
+        try:
+            result = database.sync_user_settings([("alice", 1000), ("bob", 1001)])
+            self.assertEqual(result["created"], 2)
+            updated = database.update_user_setting(
+                "alice",
+                email="alice@example.com",
+                is_admin=True,
+                notify_temperature=True,
+                notify_process_end=True,
+            )
+            self.assertEqual(updated["email"], "alice@example.com")
+            self.assertTrue(updated["is_admin"])
+            result = database.sync_user_settings([("bob", 1001)])
+            self.assertEqual(result["deactivated"], 1)
+            users = database.list_user_settings(active_only=True)
+            self.assertEqual([user["username"] for user in users], ["bob"])
+            self.assertEqual(database.admin_emails(), [])
+            database.sync_user_settings([("alice", 1000), ("bob", 1001)])
+            self.assertEqual(database.admin_emails(), ["alice@example.com"])
+            self.assertEqual(database.process_end_usernames(), {"alice"})
         finally:
             database.close()
 
@@ -482,6 +551,23 @@ class DatabaseTests(unittest.TestCase):
 
 
 class AlertTests(unittest.TestCase):
+    def _seed_users(self, database: Database) -> None:
+        database.sync_user_settings([("alice", 1000), ("admin", 1001)])
+        database.update_user_setting(
+            "alice",
+            email="alice@example.com",
+            is_admin=False,
+            notify_temperature=True,
+            notify_process_end=False,
+        )
+        database.update_user_setting(
+            "admin",
+            email="admin@example.com",
+            is_admin=True,
+            notify_temperature=True,
+            notify_process_end=False,
+        )
+
     def test_restart_scan_recovers_persisted_active_alert(self) -> None:
         database = Database(":memory:")
         database.open()
@@ -493,7 +579,7 @@ class AlertTests(unittest.TestCase):
             manager = AlertManager(
                 AlertConfig(),
                 database,
-                EmailSender(EmailConfig(enabled=False), {}),
+                EmailSender(EmailConfig(enabled=False), database),
             )
             recovered_gpu = {
                 "uuid": "GPU-1",
@@ -537,6 +623,7 @@ class AlertTests(unittest.TestCase):
         database = Database(":memory:")
         database.open()
         try:
+            self._seed_users(database)
             alerts = AlertManager(
                 AlertConfig(
                     high_temperature_celsius=85,
@@ -546,10 +633,7 @@ class AlertTests(unittest.TestCase):
                     reminder_interval_seconds=10,
                 ),
                 database,
-                EmailSender(
-                    EmailConfig(enabled=False, admin_emails=("admin@example.com",)),
-                    {"alice": UserConfig(email="alice@example.com")},
-                ),
+                EmailSender(EmailConfig(enabled=False), database),
             )
             gpu = {"uuid": "GPU-1", "index": 0, "temperature_celsius": 90}
             process = {"gpu_uuid": "GPU-1", "username": "alice"}
@@ -583,7 +667,7 @@ class AlertTests(unittest.TestCase):
             alerts = AlertManager(
                 AlertConfig(high_duration_seconds=1, reminder_interval_seconds=2),
                 database,
-                EmailSender(EmailConfig(enabled=False), {}),
+                EmailSender(EmailConfig(enabled=False), database),
             )
             gpu = {"uuid": "GPU-1", "index": 0, "temperature_celsius": 90}
             alerts.evaluate([gpu], [], monotonic_now=0, wall_now=100)
@@ -603,16 +687,17 @@ class ProcessEndNotificationTests(unittest.TestCase):
         database = Database(":memory:")
         database.open()
         try:
-            sender = EmailSender(
-                EmailConfig(
-                    enabled=False,
-                    admin_emails=("admin@example.com",),
-                ),
-                {"alice": UserConfig(email="alice@example.com")},
+            database.sync_user_settings([("alice", 1000)])
+            database.update_user_setting(
+                "alice",
+                email="alice@example.com",
+                is_admin=False,
+                notify_temperature=True,
+                notify_process_end=True,
             )
+            sender = EmailSender(EmailConfig(enabled=False), database)
             manager = ProcessEndManager(
                 ProcessEndNotificationConfig(
-                    users=("alice",),
                     missing_duration_seconds=20,
                     min_runtime_seconds=300,
                 ),
@@ -651,17 +736,20 @@ class ProcessEndNotificationTests(unittest.TestCase):
         database = Database(":memory:")
         database.open()
         try:
-            sender = EmailSender(
-                EmailConfig(enabled=False),
-                {"alice": UserConfig(email="alice@example.com")},
+            database.sync_user_settings([("alice", 1000)])
+            database.update_user_setting(
+                "alice",
+                email="alice@example.com",
+                is_admin=False,
+                notify_temperature=True,
+                notify_process_end=True,
             )
             manager = ProcessEndManager(
                 ProcessEndNotificationConfig(
-                    users=("alice",),
                     missing_duration_seconds=20,
                     min_runtime_seconds=300,
                 ),
-                sender,
+                EmailSender(EmailConfig(enabled=False), database),
                 database,
             )
             process = {
@@ -719,7 +807,7 @@ class DiskAndApiTests(unittest.TestCase):
         self.assertEqual(disks[0]["physical_disks"][0]["device"], "/dev/sda")
         physical_info.assert_called_once_with("/dev/sda1")
 
-    def test_api_exposes_monitoring_and_fan_control_routes(self) -> None:
+    def test_api_exposes_monitoring_and_settings_routes(self) -> None:
         app = create_app(Config(database=DatabaseConfig(path=":memory:")))
         monitored_paths = {
             "/api/summary",
@@ -729,6 +817,7 @@ class DiskAndApiTests(unittest.TestCase):
             "/api/disks",
             "/api/alerts",
             "/api/history",
+            "/api/settings/users",
             "/health",
         }
         route_methods = {
@@ -737,15 +826,21 @@ class DiskAndApiTests(unittest.TestCase):
             if getattr(route, "path", None) in monitored_paths
         }
         self.assertEqual(set(route_methods), monitored_paths)
-        for methods in route_methods.values():
+        for path, methods in route_methods.items():
             self.assertEqual(methods, {"GET"})
         fan_route = next(
             route
             for route in app.routes
             if getattr(route, "path", None)
-            == "/api/gpus/{gpu_uuid}/fan-control"
+            == "/api/gpus/{gpu_uuid}/fan-profile"
         )
         self.assertEqual(fan_route.methods, {"PUT"})
+        sync_route = next(
+            route
+            for route in app.routes
+            if getattr(route, "path", None) == "/api/settings/users/sync"
+        )
+        self.assertEqual(sync_route.methods, {"POST"})
 
         history_route = next(
             route for route in app.routes if getattr(route, "path", None) == "/api/history"
@@ -779,6 +874,10 @@ class DiskAndApiTests(unittest.TestCase):
                     patch.object(service.gpu_monitor, "initialize"),
                     patch.object(service.gpu_monitor, "close"),
                     patch.object(service, "collect_once"),
+                    patch(
+                        "simple_node_sentinel.main.sync_user_settings",
+                        return_value={"created": 0, "synced_at": 1},
+                    ),
                 ):
                     async with app.router.lifespan_context(app):
                         self.assertTrue(service.running)

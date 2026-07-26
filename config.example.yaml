@@ -2,6 +2,9 @@
 # Production path: /etc/simple-node-sentinel/config.yaml
 # Leave sensitive or site-specific fields empty, then fill them during install
 # or with: sudoedit /etc/simple-node-sentinel/config.yaml
+#
+# User emails, admin flags, process-end notify toggles, and per-GPU fan curves
+# live in the SQLite database and are edited from the dashboard.
 
 collection:
   interval_seconds: 2
@@ -16,18 +19,9 @@ database:
 
 fan_control:
   # Requires root and NVIDIA drivers exposing the NVML v2 fan-control API.
-  # Everyone who can reach the dashboard can change these controls.
+  # Everyone who can reach the dashboard can edit per-GPU curves.
   enabled: true
-  minimum_percent: 60
-  maximum_percent: 90
   step_percent: 5
-  # An idle GPU must remain below this temperature for the full duration
-  # before it is forced back to NVIDIA automatic mode.
-  idle_temperature_celsius: 60
-  idle_duration_seconds: 20
-  # A hot GPU is forced to at least this manual fan target.
-  emergency_temperature_celsius: 83
-  emergency_fan_percent: 80
 
 alerts:
   high_temperature_celsius: 85
@@ -50,32 +44,9 @@ email:
   password_file: /etc/simple-node-sentinel/smtp-password
   # Envelope From address shown to recipients. Example: monitor@example.com
   from_address: ""
-  # Administrator recipients for GPU temperature alerts.
-  # Example:
-  #   admin_emails:
-  #     - admin@example.com
-  admin_emails: []
 
-# Map Linux usernames to email addresses. Do not guess addresses.
-# Example:
-#   users:
-#     user1:
-#       email: user1@example.com
-#     user2:
-#       email: user2@example.com
-users: {}
-
-# Notify only listed Linux users when their own GPU process ends.
-# The process must have run for at least min_runtime_seconds, then be
-# missing from NVML for missing_duration_seconds.
-# Example:
-#   process_end_notifications:
-#     min_runtime_seconds: 300
-#     missing_duration_seconds: 20
-#     users:
-#       - user1
-#       - user2
+# Debounce for process-end emails. Recipients are chosen in the dashboard
+# (notify_process_end on synced Linux login users).
 process_end_notifications:
   min_runtime_seconds: 300
   missing_duration_seconds: 20
-  users: []

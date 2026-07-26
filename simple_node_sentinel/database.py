@@ -7,6 +7,12 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+DEFAULT_FAN_MINIMUM_PERCENT = 30
+DEFAULT_FAN_MAXIMUM_PERCENT = 100
+DEFAULT_FAN_IDLE_TEMPERATURE_CELSIUS = 60.0
+DEFAULT_FAN_IDLE_DURATION_SECONDS = 20.0
+DEFAULT_FAN_CURVE_POINTS: tuple[tuple[float, int], ...] = ((80.0, 80),)
+
 
 class Database:
     def __init__(self, path: str) -> None:
@@ -24,6 +30,7 @@ class Database:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS gpu_process_records (
@@ -60,12 +67,34 @@ class Database:
                     error TEXT,
                     FOREIGN KEY(alert_id) REFERENCES alerts(id)
                 );
-                CREATE TABLE IF NOT EXISTS gpu_fan_control_state (
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    username TEXT PRIMARY KEY,
+                    uid INTEGER,
+                    email TEXT,
+                    is_admin INTEGER NOT NULL DEFAULT 0,
+                    notify_temperature INTEGER NOT NULL DEFAULT 1,
+                    notify_process_end INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    updated_at REAL NOT NULL,
+                    last_synced_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS gpu_fan_profiles (
                     gpu_uuid TEXT PRIMARY KEY,
-                    mode TEXT NOT NULL CHECK(mode IN ('auto', 'manual')),
-                    target_percent INTEGER,
+                    minimum_percent INTEGER NOT NULL,
+                    maximum_percent INTEGER NOT NULL,
+                    idle_temperature_celsius REAL NOT NULL,
+                    idle_duration_seconds REAL NOT NULL,
                     revision INTEGER NOT NULL,
                     updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS gpu_fan_curve_points (
+                    id INTEGER PRIMARY KEY,
+                    gpu_uuid TEXT NOT NULL,
+                    temperature_celsius REAL NOT NULL,
+                    fan_percent INTEGER NOT NULL,
+                    UNIQUE(gpu_uuid, temperature_celsius),
+                    FOREIGN KEY(gpu_uuid) REFERENCES gpu_fan_profiles(gpu_uuid)
+                        ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_process_ended
                     ON gpu_process_records(ended_at);
@@ -73,6 +102,8 @@ class Database:
                     ON alerts(recovered_at);
                 CREATE INDEX IF NOT EXISTS idx_email_created
                     ON email_records(created_at);
+                CREATE INDEX IF NOT EXISTS idx_fan_curve_gpu
+                    ON gpu_fan_curve_points(gpu_uuid, temperature_celsius);
                 CREATE TABLE IF NOT EXISTS system_metric_samples (
                     sampled_at REAL PRIMARY KEY,
                     cpu_usage_percent REAL,
@@ -120,7 +151,57 @@ class Database:
                     ON disk_metric_samples(sampled_at);
                 """
             )
+            self._migrate_legacy_fan_state()
             self._connection.commit()
+
+    def _migrate_legacy_fan_state(self) -> None:
+        assert self._connection is not None
+        exists = self._connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='gpu_fan_control_state'
+            """
+        ).fetchone()
+        if exists is None:
+            return
+        now = time.time()
+        rows = self._connection.execute(
+            "SELECT gpu_uuid FROM gpu_fan_control_state"
+        ).fetchall()
+        for row in rows:
+            gpu_uuid = str(row["gpu_uuid"])
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO gpu_fan_profiles (
+                    gpu_uuid, minimum_percent, maximum_percent,
+                    idle_temperature_celsius, idle_duration_seconds,
+                    revision, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    gpu_uuid,
+                    DEFAULT_FAN_MINIMUM_PERCENT,
+                    DEFAULT_FAN_MAXIMUM_PERCENT,
+                    DEFAULT_FAN_IDLE_TEMPERATURE_CELSIUS,
+                    DEFAULT_FAN_IDLE_DURATION_SECONDS,
+                    now,
+                ),
+            )
+            point_count = self._connection.execute(
+                "SELECT COUNT(*) FROM gpu_fan_curve_points WHERE gpu_uuid=?",
+                (gpu_uuid,),
+            ).fetchone()[0]
+            if point_count == 0:
+                for temperature, fan_percent in DEFAULT_FAN_CURVE_POINTS:
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO gpu_fan_curve_points (
+                            gpu_uuid, temperature_celsius, fan_percent
+                        ) VALUES (?, ?, ?)
+                        """,
+                        (gpu_uuid, temperature, fan_percent),
+                    )
+        self._connection.execute("DROP TABLE gpu_fan_control_state")
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -134,58 +215,352 @@ class Database:
                 self._connection.close()
                 self._connection = None
 
-    def ensure_fan_control_state(self, gpu_uuid: str) -> dict[str, Any]:
+    @staticmethod
+    def _bool(value: Any) -> bool:
+        return bool(int(value))
+
+    def _profile_from_rows(
+        self, profile_row: sqlite3.Row, point_rows: Iterable[sqlite3.Row]
+    ) -> dict[str, Any]:
+        points = [
+            {
+                "temperature_celsius": float(row["temperature_celsius"]),
+                "fan_percent": int(row["fan_percent"]),
+            }
+            for row in point_rows
+        ]
+        points.sort(key=lambda item: item["temperature_celsius"])
+        mode = "curve" if points else "auto"
+        return {
+            "gpu_uuid": str(profile_row["gpu_uuid"]),
+            "minimum_percent": int(profile_row["minimum_percent"]),
+            "maximum_percent": int(profile_row["maximum_percent"]),
+            "idle_temperature_celsius": float(
+                profile_row["idle_temperature_celsius"]
+            ),
+            "idle_duration_seconds": float(profile_row["idle_duration_seconds"]),
+            "revision": int(profile_row["revision"]),
+            "updated_at": float(profile_row["updated_at"]),
+            "mode": mode,
+            "curve_points": points,
+        }
+
+    def _load_fan_profile_locked(self, gpu_uuid: str) -> dict[str, Any] | None:
+        profile = self.connection.execute(
+            "SELECT * FROM gpu_fan_profiles WHERE gpu_uuid=?",
+            (gpu_uuid,),
+        ).fetchone()
+        if profile is None:
+            return None
+        points = self.connection.execute(
+            """
+            SELECT temperature_celsius, fan_percent
+            FROM gpu_fan_curve_points
+            WHERE gpu_uuid=?
+            ORDER BY temperature_celsius
+            """,
+            (gpu_uuid,),
+        ).fetchall()
+        return self._profile_from_rows(profile, points)
+
+    def ensure_fan_profile(self, gpu_uuid: str) -> dict[str, Any]:
         now = time.time()
         with self._lock, self.connection:
+            existing = self._load_fan_profile_locked(gpu_uuid)
+            if existing is not None:
+                return existing
             self.connection.execute(
                 """
-                INSERT OR IGNORE INTO gpu_fan_control_state (
-                    gpu_uuid, mode, target_percent, revision, updated_at
-                ) VALUES (?, 'auto', NULL, 0, ?)
+                INSERT INTO gpu_fan_profiles (
+                    gpu_uuid, minimum_percent, maximum_percent,
+                    idle_temperature_celsius, idle_duration_seconds,
+                    revision, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?)
                 """,
-                (gpu_uuid, now),
+                (
+                    gpu_uuid,
+                    DEFAULT_FAN_MINIMUM_PERCENT,
+                    DEFAULT_FAN_MAXIMUM_PERCENT,
+                    DEFAULT_FAN_IDLE_TEMPERATURE_CELSIUS,
+                    DEFAULT_FAN_IDLE_DURATION_SECONDS,
+                    now,
+                ),
             )
-            row = self.connection.execute(
-                "SELECT * FROM gpu_fan_control_state WHERE gpu_uuid=?",
-                (gpu_uuid,),
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("unable to create GPU fan control state")
-        return dict(row)
+            for temperature, fan_percent in DEFAULT_FAN_CURVE_POINTS:
+                self.connection.execute(
+                    """
+                    INSERT INTO gpu_fan_curve_points (
+                        gpu_uuid, temperature_celsius, fan_percent
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (gpu_uuid, temperature, fan_percent),
+                )
+            created = self._load_fan_profile_locked(gpu_uuid)
+        if created is None:
+            raise RuntimeError("unable to create GPU fan profile")
+        return created
 
-    def get_fan_control_state(self, gpu_uuid: str) -> dict[str, Any] | None:
+    def get_fan_profile(self, gpu_uuid: str) -> dict[str, Any] | None:
         with self._lock:
-            row = self.connection.execute(
-                "SELECT * FROM gpu_fan_control_state WHERE gpu_uuid=?",
-                (gpu_uuid,),
-            ).fetchone()
-        return dict(row) if row is not None else None
+            return self._load_fan_profile_locked(gpu_uuid)
 
-    def update_fan_control_state(
+    def update_fan_profile(
         self,
         gpu_uuid: str,
-        mode: str,
-        target_percent: int | None,
+        *,
+        minimum_percent: int,
+        maximum_percent: int,
+        idle_temperature_celsius: float,
+        idle_duration_seconds: float,
+        curve_points: Iterable[dict[str, Any]],
         expected_revision: int,
         updated_at: float | None = None,
     ) -> dict[str, Any] | None:
         now = updated_at if updated_at is not None else time.time()
+        points = [
+            {
+                "temperature_celsius": float(point["temperature_celsius"]),
+                "fan_percent": int(point["fan_percent"]),
+            }
+            for point in curve_points
+        ]
+        points.sort(key=lambda item: item["temperature_celsius"])
         with self._lock, self.connection:
             cursor = self.connection.execute(
                 """
-                UPDATE gpu_fan_control_state
-                SET mode=?, target_percent=?, revision=revision + 1, updated_at=?
+                UPDATE gpu_fan_profiles
+                SET minimum_percent=?, maximum_percent=?,
+                    idle_temperature_celsius=?, idle_duration_seconds=?,
+                    revision=revision + 1, updated_at=?
                 WHERE gpu_uuid=? AND revision=?
                 """,
-                (mode, target_percent, now, gpu_uuid, expected_revision),
+                (
+                    minimum_percent,
+                    maximum_percent,
+                    idle_temperature_celsius,
+                    idle_duration_seconds,
+                    now,
+                    gpu_uuid,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            self.connection.execute(
+                "DELETE FROM gpu_fan_curve_points WHERE gpu_uuid=?",
+                (gpu_uuid,),
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO gpu_fan_curve_points (
+                    gpu_uuid, temperature_celsius, fan_percent
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (gpu_uuid, point["temperature_celsius"], point["fan_percent"])
+                    for point in points
+                ],
+            )
+            return self._load_fan_profile_locked(gpu_uuid)
+
+    def _user_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "username": str(row["username"]),
+            "uid": row["uid"],
+            "email": row["email"],
+            "is_admin": self._bool(row["is_admin"]),
+            "notify_temperature": self._bool(row["notify_temperature"]),
+            "notify_process_end": self._bool(row["notify_process_end"]),
+            "active": self._bool(row["active"]),
+            "updated_at": float(row["updated_at"]),
+            "last_synced_at": float(row["last_synced_at"]),
+        }
+
+    def list_user_settings(self, *, active_only: bool = True) -> list[dict[str, Any]]:
+        query = "SELECT * FROM user_settings"
+        if active_only:
+            query += " WHERE active=1"
+        query += " ORDER BY username"
+        with self._lock:
+            rows = self.connection.execute(query).fetchall()
+        return [self._user_from_row(row) for row in rows]
+
+    def get_user_setting(self, username: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM user_settings WHERE username=?",
+                (username,),
+            ).fetchone()
+        return self._user_from_row(row) if row is not None else None
+
+    def sync_user_settings(
+        self, system_users: Iterable[tuple[str, int]]
+    ) -> dict[str, Any]:
+        now = time.time()
+        present = {username: uid for username, uid in system_users}
+        with self._lock, self.connection:
+            existing = {
+                str(row["username"]): dict(row)
+                for row in self.connection.execute(
+                    "SELECT * FROM user_settings"
+                ).fetchall()
+            }
+            created = 0
+            reactivated = 0
+            deactivated = 0
+            for username, uid in present.items():
+                row = existing.get(username)
+                if row is None:
+                    self.connection.execute(
+                        """
+                        INSERT INTO user_settings (
+                            username, uid, email, is_admin, notify_temperature,
+                            notify_process_end, active, updated_at, last_synced_at
+                        ) VALUES (?, ?, NULL, 0, 1, 0, 1, ?, ?)
+                        """,
+                        (username, uid, now, now),
+                    )
+                    created += 1
+                    continue
+                was_active = self._bool(row["active"])
+                self.connection.execute(
+                    """
+                    UPDATE user_settings
+                    SET uid=?, active=1, last_synced_at=?
+                    WHERE username=?
+                    """,
+                    (uid, now, username),
+                )
+                if not was_active:
+                    reactivated += 1
+            for username, row in existing.items():
+                if username in present:
+                    continue
+                if not self._bool(row["active"]):
+                    self.connection.execute(
+                        "UPDATE user_settings SET last_synced_at=? WHERE username=?",
+                        (now, username),
+                    )
+                    continue
+                self.connection.execute(
+                    """
+                    UPDATE user_settings
+                    SET active=0, last_synced_at=?, updated_at=?
+                    WHERE username=?
+                    """,
+                    (now, now, username),
+                )
+                deactivated += 1
+        return {
+            "created": created,
+            "reactivated": reactivated,
+            "deactivated": deactivated,
+            "active": len(present),
+            "synced_at": now,
+        }
+
+    def update_user_setting(
+        self,
+        username: str,
+        *,
+        email: str | None,
+        is_admin: bool,
+        notify_temperature: bool,
+        notify_process_end: bool,
+    ) -> dict[str, Any] | None:
+        now = time.time()
+        normalized_email = (email or "").strip() or None
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE user_settings
+                SET email=?, is_admin=?, notify_temperature=?,
+                    notify_process_end=?, updated_at=?
+                WHERE username=? AND active=1
+                """,
+                (
+                    normalized_email,
+                    int(is_admin),
+                    int(notify_temperature),
+                    int(notify_process_end),
+                    now,
+                    username,
+                ),
             )
             if cursor.rowcount != 1:
                 return None
             row = self.connection.execute(
-                "SELECT * FROM gpu_fan_control_state WHERE gpu_uuid=?",
-                (gpu_uuid,),
+                "SELECT * FROM user_settings WHERE username=?",
+                (username,),
             ).fetchone()
-        return dict(row) if row is not None else None
+        return self._user_from_row(row) if row is not None else None
+
+    def apply_legacy_user_import(
+        self,
+        users: dict[str, str],
+        admin_emails: Iterable[str],
+        process_end_users: Iterable[str],
+    ) -> None:
+        admin_set = {email.lower() for email in admin_emails}
+        process_end_set = set(process_end_users)
+        now = time.time()
+        with self._lock, self.connection:
+            rows = self.connection.execute(
+                "SELECT * FROM user_settings WHERE active=1"
+            ).fetchall()
+            for row in rows:
+                username = str(row["username"])
+                email = row["email"]
+                if username in users and not email:
+                    email = users[username]
+                is_admin = self._bool(row["is_admin"])
+                if email and str(email).lower() in admin_set:
+                    is_admin = True
+                notify_process_end = self._bool(row["notify_process_end"])
+                if username in process_end_set:
+                    notify_process_end = True
+                if (
+                    email == row["email"]
+                    and is_admin == self._bool(row["is_admin"])
+                    and notify_process_end == self._bool(row["notify_process_end"])
+                ):
+                    continue
+                self.connection.execute(
+                    """
+                    UPDATE user_settings
+                    SET email=?, is_admin=?, notify_process_end=?, updated_at=?
+                    WHERE username=?
+                    """,
+                    (
+                        email,
+                        int(is_admin),
+                        int(notify_process_end),
+                        now,
+                        username,
+                    ),
+                )
+
+    def admin_emails(self) -> list[str]:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT email FROM user_settings
+                WHERE active=1 AND is_admin=1
+                  AND email IS NOT NULL AND TRIM(email) != ''
+                ORDER BY email
+                """
+            ).fetchall()
+        return [str(row["email"]) for row in rows]
+
+    def process_end_usernames(self) -> set[str]:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT username FROM user_settings
+                WHERE active=1 AND notify_process_end=1
+                """
+            ).fetchall()
+        return {str(row["username"]) for row in rows}
 
     def reconcile_gpu_processes(
         self, processes: Iterable[dict[str, Any]], observed_at: float | None = None

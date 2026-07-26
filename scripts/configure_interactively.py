@@ -65,84 +65,6 @@ def fill_scalar(
     return False
 
 
-def fill_email_list(
-    mapping: dict[str, Any],
-    key: str,
-    label: str,
-    hint: str,
-) -> bool:
-    current = mapping.get(key) or []
-    if not is_empty(current):
-        return False
-    print(f"\nEmpty field: {label}")
-    if not prompt_yes_no("Fill this field now?", default_no=True):
-        return False
-    print(f"  hint: {hint}")
-    print("  Enter one value per line. Press Enter on an empty line to finish.")
-    values: list[str] = []
-    while True:
-        item = prompt("  item", default="")
-        if not item:
-            break
-        values.append(item)
-    mapping[key] = values
-    return bool(values)
-
-
-def fill_users(root: dict[str, Any]) -> bool:
-    users = root.get("users")
-    if isinstance(users, dict) and users:
-        return False
-    print("\nEmpty field: users")
-    print("  Map Linux usernames to email addresses.")
-    if not prompt_yes_no("Add users now?", default_no=True):
-        root["users"] = {}
-        return False
-    filled: dict[str, dict[str, str]] = {}
-    print("  Enter username, then email. Press Enter on username to finish.")
-    while True:
-        username = prompt("  Linux username", default="")
-        if not username:
-            break
-        email = prompt(
-            f"  email for {username}",
-            hint="example: name@example.com",
-            default="",
-        )
-        if email:
-            filled[username] = {"email": email}
-        else:
-            print("  skipped user without email")
-    root["users"] = filled
-    return bool(filled)
-
-
-def fill_process_end_users(root: dict[str, Any]) -> bool:
-    section = ensure_mapping(root, "process_end_notifications")
-    current = section.get("users") or []
-    if not is_empty(current):
-        return False
-    print("\nEmpty field: process_end_notifications.users")
-    print("  Linux usernames that should be emailed when their GPU process ends.")
-    if not prompt_yes_no("Fill this field now?", default_no=True):
-        section["users"] = []
-        return False
-    known_users = sorted((root.get("users") or {}).keys())
-    if known_users:
-        print(f"  known users from users map: {', '.join(known_users)}")
-    print("  Enter one username per line. Press Enter on an empty line to finish.")
-    values: list[str] = []
-    while True:
-        item = prompt("  username", default="")
-        if not item:
-            break
-        values.append(item)
-    section["users"] = values
-    if "missing_duration_seconds" not in section:
-        section["missing_duration_seconds"] = 20
-    return bool(values)
-
-
 def maybe_enable_email(email: dict[str, Any]) -> None:
     if email.get("enabled"):
         return
@@ -158,6 +80,7 @@ def write_config(path: Path, data: dict[str, Any]) -> None:
     header = (
         "# Generated/updated by scripts/configure_interactively.py\n"
         "# Edit manually anytime with: sudoedit /etc/simple-node-sentinel/config.yaml\n"
+        "# User notification and fan-curve settings are edited in the dashboard.\n"
     )
     text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     path.write_text(header + text, encoding="utf-8")
@@ -221,9 +144,37 @@ def main() -> int:
 
     print(f"Checking empty fields in {config_path}")
     print("Press Enter to skip any prompt.")
+    print(
+        "User emails / admin / process-end notify and per-GPU fan curves "
+        "are configured in the web dashboard, not here."
+    )
 
-    email = ensure_mapping(raw, "email")
+    # Drop obsolete YAML sections if an older template was copied.
     changed = False
+    if "users" in raw:
+        raw.pop("users", None)
+        changed = True
+    email = ensure_mapping(raw, "email")
+    if "admin_emails" in email:
+        email.pop("admin_emails", None)
+        changed = True
+    process_end = ensure_mapping(raw, "process_end_notifications")
+    if "users" in process_end:
+        process_end.pop("users", None)
+        changed = True
+    fan = ensure_mapping(raw, "fan_control")
+    for obsolete in (
+        "minimum_percent",
+        "maximum_percent",
+        "idle_temperature_celsius",
+        "idle_duration_seconds",
+        "emergency_temperature_celsius",
+        "emergency_fan_percent",
+    ):
+        if obsolete in fan:
+            fan.pop(obsolete, None)
+            changed = True
+
     changed |= fill_scalar(
         email,
         "smtp_host",
@@ -250,14 +201,6 @@ def main() -> int:
             "absolute path to the SMTP password file",
             default=args.password_file_default,
         )
-    changed |= fill_email_list(
-        email,
-        "admin_emails",
-        "email.admin_emails",
-        "administrator emails for GPU temperature alerts",
-    )
-    changed |= fill_users(raw)
-    changed |= fill_process_end_users(raw)
 
     if is_empty(email.get("password_file")):
         email["password_file"] = args.password_file_default

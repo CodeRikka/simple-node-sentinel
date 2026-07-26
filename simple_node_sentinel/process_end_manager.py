@@ -46,7 +46,7 @@ class ProcessEndManager:
     ) -> None:
         now = monotonic_now if monotonic_now is not None else time.monotonic()
         wall = wall_now if wall_now is not None else time.time()
-        configured_users = set(self.config.users)
+        configured_users = self.database.process_end_usernames()
         current: set[ProcessKey] = set()
 
         for process in processes:
@@ -105,6 +105,7 @@ class ProcessEndManager:
             body,
             [username],
             include_admins=False,
+            notify="process_end",
         )
         self.database.record_email(
             None, "process_end", recipients, status, error

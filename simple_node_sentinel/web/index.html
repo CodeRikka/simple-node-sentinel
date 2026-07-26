@@ -88,7 +88,33 @@
           </table>
         </div>
       </section>
+      <section class="detail-section">
+        <div class="section-heading">
+          <div><span class="eyebrow">Notifications</span><h2>User settings</h2></div>
+          <div class="section-actions">
+            <p id="user-settings-sync-meta">Synced Linux login users</p>
+            <button id="user-settings-sync" class="small-button" type="button">Sync users</button>
+            <button id="user-settings-edit" class="small-button" type="button">Edit</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="user-settings">
+            <thead>
+              <tr>
+                <th>User</th>
+                <th>Email</th>
+                <th>Admin</th>
+                <th>Temp alert</th>
+                <th>Process end</th>
+                <th class="user-settings-actions-col"></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
     </main>
+    <div id="modal-root"></div>
     <script src="/static/chart.js"></script>
     <script src="/static/app.js"></script>
   </body>

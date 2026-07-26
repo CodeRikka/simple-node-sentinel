@@ -14,7 +14,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .alert_manager import AlertManager
 from .config import Config, load_config
@@ -25,15 +25,32 @@ from .gpu_monitor import GpuMonitor
 from .process_end_manager import ProcessEndManager
 from .process_monitor import ProcessMonitor
 from .system_monitor import collect_disks, collect_system_summary
+from .user_directory import apply_legacy_user_import, sync_user_settings
 
 LOGGER = logging.getLogger(__name__)
 WEB_DIRECTORY = Path(__file__).with_name("web")
+USER_SYNC_INTERVAL_SECONDS = 6 * 3600
 
 
-class FanControlRequest(BaseModel):
-    mode: str
-    target_percent: int | None = None
+class FanCurvePointModel(BaseModel):
+    temperature_celsius: float = Field(ge=0, le=120)
+    fan_percent: int = Field(ge=0, le=100)
+
+
+class FanProfileRequest(BaseModel):
+    minimum_percent: int = Field(ge=0, le=100)
+    maximum_percent: int = Field(ge=0, le=100)
+    idle_temperature_celsius: float = Field(gt=0, le=120)
+    idle_duration_seconds: float = Field(gt=0)
+    curve_points: list[FanCurvePointModel] = Field(default_factory=list)
     expected_revision: int
+
+
+class UserSettingsUpdateRequest(BaseModel):
+    email: str | None = None
+    is_admin: bool = False
+    notify_temperature: bool = True
+    notify_process_end: bool = False
 
 
 class SentinelService:
@@ -43,7 +60,7 @@ class SentinelService:
         self.gpu_monitor = GpuMonitor()
         self.fan_controller = GpuFanController()
         self.process_monitor = ProcessMonitor()
-        self.email_sender = EmailSender(config.email, config.users)
+        self.email_sender = EmailSender(config.email, self.database)
         self.alert_manager = AlertManager(
             config.alerts, self.database, self.email_sender
         )
@@ -66,6 +83,8 @@ class SentinelService:
         }
         self._last_disk_sample = 0.0
         self._last_cleanup = 0.0
+        self._last_user_sync = 0.0
+        self._user_sync_result: dict[str, Any] | None = None
         self.last_success: float | None = None
         self.last_error: str | None = None
         self.running = False
@@ -73,6 +92,9 @@ class SentinelService:
 
     async def start(self) -> None:
         self.database.open()
+        self._user_sync_result = sync_user_settings(self.database)
+        apply_legacy_user_import(self.database, self.config.legacy_import)
+        self._last_user_sync = time.monotonic()
         self.gpu_monitor.initialize()
         if self.config.fan_control.enabled:
             self.fan_controller.initialize()
@@ -108,6 +130,13 @@ class SentinelService:
 
     def collect_once(self) -> None:
         monotonic_now = time.monotonic()
+        if (
+            monotonic_now - self._last_user_sync
+            >= USER_SYNC_INTERVAL_SECONDS
+        ):
+            self._user_sync_result = sync_user_settings(self.database)
+            self._last_user_sync = monotonic_now
+
         gpus, raw_gpu_processes = self.gpu_monitor.collect()
         self._refresh_fan_controls(gpus, monotonic_now)
         gpu_processes = self.process_monitor.inspect_gpu_processes(
@@ -178,6 +207,7 @@ class SentinelService:
                 "error": "Fan control is disabled by configuration",
                 "idle_locked": False,
                 "idle_since": None,
+                "applied_percent": None,
             }
         elif not self.fan_controller.initialized:
             runtime = {
@@ -185,6 +215,7 @@ class SentinelService:
                 "error": self.fan_controller.last_error or "Fan control is unavailable",
                 "idle_locked": False,
                 "idle_since": None,
+                "applied_percent": None,
             }
         else:
             supported, error = self.fan_controller.supports(gpu_uuid)
@@ -193,38 +224,47 @@ class SentinelService:
                 "error": error,
                 "idle_locked": False,
                 "idle_since": None,
+                "applied_percent": None,
             }
         self._fan_runtime[gpu_uuid] = runtime
         return runtime
 
+    @staticmethod
+    def _curve_target(
+        temperature: float | None, points: list[dict[str, Any]]
+    ) -> int | None:
+        if temperature is None or not points:
+            return None
+        desired: int | None = None
+        for point in points:
+            if temperature >= float(point["temperature_celsius"]):
+                desired = int(point["fan_percent"])
+        return desired
+
     def _fan_payload(
-        self, gpu_uuid: str, state: dict[str, Any]
+        self, gpu_uuid: str, profile: dict[str, Any]
     ) -> dict[str, Any]:
         runtime = self._runtime_for_gpu(gpu_uuid)
         idle_locked = bool(runtime["idle_locked"])
+        points = list(profile.get("curve_points") or [])
+        mode = "curve" if points else "auto"
         return {
             "enabled": self.config.fan_control.enabled,
             "supported": bool(runtime["supported"]),
-            "mode": state["mode"],
-            "target_percent": state["target_percent"],
-            "revision": state["revision"],
-            "manual_allowed": bool(runtime["supported"]) and not idle_locked,
+            "mode": mode,
+            "applied_percent": runtime.get("applied_percent"),
+            "revision": profile["revision"],
+            "curve_active": mode == "curve" and not idle_locked,
             "idle_locked": idle_locked,
             "idle_pending": bool(runtime.get("idle_pending")),
             "idle_remaining_seconds": runtime.get("idle_remaining_seconds"),
-            "emergency_active": bool(runtime.get("emergency_active")),
             "error": runtime.get("error"),
-            "minimum_percent": self.config.fan_control.minimum_percent,
-            "maximum_percent": self.config.fan_control.maximum_percent,
+            "minimum_percent": profile["minimum_percent"],
+            "maximum_percent": profile["maximum_percent"],
             "step_percent": self.config.fan_control.step_percent,
-            "idle_temperature_celsius": (
-                self.config.fan_control.idle_temperature_celsius
-            ),
-            "idle_duration_seconds": self.config.fan_control.idle_duration_seconds,
-            "emergency_temperature_celsius": (
-                self.config.fan_control.emergency_temperature_celsius
-            ),
-            "emergency_fan_percent": self.config.fan_control.emergency_fan_percent,
+            "idle_temperature_celsius": profile["idle_temperature_celsius"],
+            "idle_duration_seconds": profile["idle_duration_seconds"],
+            "curve_points": points,
         }
 
     def _refresh_fan_controls(
@@ -236,18 +276,22 @@ class SentinelService:
         with self._fan_control_lock:
             for gpu in gpus:
                 gpu_uuid = str(gpu["uuid"])
-                existing = self.database.get_fan_control_state(gpu_uuid)
-                state = existing or self.database.ensure_fan_control_state(gpu_uuid)
+                existing = self.database.get_fan_profile(gpu_uuid)
+                profile = existing or self.database.ensure_fan_profile(gpu_uuid)
                 runtime = self._runtime_for_gpu(gpu_uuid)
                 control_succeeded = True
                 temperature = gpu.get("temperature_celsius")
                 temperature = float(temperature) if temperature is not None else None
                 process_count = int(gpu.get("process_count") or 0)
+                points = list(profile.get("curve_points") or [])
+                idle_temperature = float(profile["idle_temperature_celsius"])
+                idle_duration = float(profile["idle_duration_seconds"])
                 was_idle_locked = bool(runtime["idle_locked"])
+
                 idle_condition = (
                     process_count == 0
                     and temperature is not None
-                    and temperature < self.config.fan_control.idle_temperature_celsius
+                    and temperature < idle_temperature
                 )
                 if idle_condition:
                     idle_since = runtime.get("idle_since")
@@ -256,13 +300,11 @@ class SentinelService:
                     runtime["idle_since"] = idle_since
                     idle_elapsed = max(0.0, now - float(idle_since))
                     idle_locked = (
-                        was_idle_locked
-                        or idle_elapsed >= self.config.fan_control.idle_duration_seconds
+                        was_idle_locked or idle_elapsed >= idle_duration
                     )
                     runtime["idle_pending"] = not idle_locked
                     runtime["idle_remaining_seconds"] = max(
-                        0.0,
-                        self.config.fan_control.idle_duration_seconds - idle_elapsed,
+                        0.0, idle_duration - idle_elapsed
                     )
                 else:
                     runtime["idle_since"] = None
@@ -272,8 +314,7 @@ class SentinelService:
                         process_count > 0
                         or (
                             temperature is not None
-                            and temperature
-                            > self.config.fan_control.idle_temperature_celsius
+                            and temperature > idle_temperature
                         )
                     ):
                         idle_locked = False
@@ -281,182 +322,175 @@ class SentinelService:
                         idle_locked = was_idle_locked
                 runtime["idle_locked"] = idle_locked
 
-                emergency_applied = False
-                fan_percent = gpu.get("fan_percent")
-                fan_percent = (
-                    float(fan_percent) if fan_percent is not None else None
-                )
-                emergency_target = self.config.fan_control.emergency_fan_percent
-                if state["mode"] == "manual" and state["target_percent"] is not None:
-                    emergency_target = max(
-                        emergency_target, int(state["target_percent"])
-                    )
-                fan_below_emergency = (
-                    fan_percent < self.config.fan_control.emergency_fan_percent
-                    if fan_percent is not None
-                    else (
-                        state["mode"] == "manual"
-                        and (
-                            state["target_percent"] is None
-                            or int(state["target_percent"])
-                            < self.config.fan_control.emergency_fan_percent
-                        )
-                    )
-                )
-                emergency_needed = (
-                    temperature is not None
-                    and temperature
-                    > self.config.fan_control.emergency_temperature_celsius
-                    and (state["mode"] != "manual" or fan_below_emergency)
-                )
-                runtime["emergency_active"] = bool(
-                    temperature is not None
-                    and temperature
-                    > self.config.fan_control.emergency_temperature_celsius
-                )
-                if runtime["supported"] and emergency_needed:
-                    try:
-                        self.fan_controller.set_manual(gpu_uuid, emergency_target)
-                        if (
-                            state["mode"] != "manual"
-                            or state["target_percent"] != emergency_target
-                        ):
-                            updated = self.database.update_fan_control_state(
-                                gpu_uuid,
-                                "manual",
-                                emergency_target,
-                                int(state["revision"]),
-                            )
-                            if updated is not None:
-                                state = updated
-                        runtime["error"] = None
-                        emergency_applied = True
-                    except FanControlError as exc:
-                        control_succeeded = False
-                        runtime["error"] = str(exc)
-                        LOGGER.error("Unable to apply emergency fan speed: %s", exc)
-
-                if (
-                    runtime["supported"]
-                    and idle_locked
-                    and (
-                        state["mode"] == "manual"
+                if not points or idle_locked:
+                    runtime["applied_percent"] = None
+                    needs_auto = runtime["supported"] and (
+                        not points
                         or not was_idle_locked
+                        or runtime.get("last_written_percent") is not None
+                        or gpu_uuid not in self._fan_restored
                         or runtime.get("error") is not None
                     )
+                    if needs_auto:
+                        try:
+                            self.fan_controller.set_auto(gpu_uuid)
+                            runtime["error"] = None
+                            runtime["last_written_percent"] = None
+                        except FanControlError as exc:
+                            control_succeeded = False
+                            runtime["error"] = str(exc)
+                            LOGGER.error(
+                                "Unable to restore automatic fan control: %s",
+                                exc,
+                            )
+                    if control_succeeded:
+                        self._fan_restored.add(gpu_uuid)
+                    gpu["fan_control"] = self._fan_payload(gpu_uuid, profile)
+                    continue
+
+                desired = self._curve_target(temperature, points)
+                applied = runtime.get("applied_percent")
+                if desired is not None:
+                    applied = max(
+                        int(applied) if applied is not None else 0, desired
+                    )
+                if applied is not None:
+                    applied = max(
+                        int(profile["minimum_percent"]),
+                        min(int(profile["maximum_percent"]), int(applied)),
+                    )
+                    runtime["applied_percent"] = applied
+                    should_write = runtime["supported"] and (
+                        runtime.get("last_written_percent") != applied
+                        or gpu_uuid not in self._fan_restored
+                    )
+                    if should_write:
+                        try:
+                            self.fan_controller.set_manual(gpu_uuid, applied)
+                            runtime["error"] = None
+                            runtime["last_written_percent"] = applied
+                        except FanControlError as exc:
+                            control_succeeded = False
+                            runtime["error"] = str(exc)
+                            LOGGER.error(
+                                "Unable to apply fan curve for %s: %s",
+                                gpu_uuid,
+                                exc,
+                            )
+                elif runtime["supported"] and (
+                    runtime.get("last_written_percent") is not None
+                    or gpu_uuid not in self._fan_restored
                 ):
                     try:
                         self.fan_controller.set_auto(gpu_uuid)
-                        if state["mode"] == "manual":
-                            updated = self.database.update_fan_control_state(
-                                gpu_uuid, "auto", None, int(state["revision"])
-                            )
-                            if updated is not None:
-                                state = updated
                         runtime["error"] = None
+                        runtime["last_written_percent"] = None
                     except FanControlError as exc:
                         control_succeeded = False
                         runtime["error"] = str(exc)
-                        LOGGER.error("Unable to restore automatic fan control: %s", exc)
+                        LOGGER.error(
+                            "Unable to restore fan state for %s: %s",
+                            gpu_uuid,
+                            exc,
+                        )
 
-                if (
-                    runtime["supported"]
-                    and gpu_uuid not in self._fan_restored
-                    and existing is not None
-                    and not idle_locked
-                    and not emergency_applied
-                ):
-                    try:
-                        if state["mode"] == "manual":
-                            self.fan_controller.set_manual(
-                                gpu_uuid, int(state["target_percent"])
-                            )
-                        else:
-                            self.fan_controller.set_auto(gpu_uuid)
-                        runtime["error"] = None
-                    except (FanControlError, TypeError, ValueError) as exc:
-                        control_succeeded = False
-                        runtime["error"] = str(exc)
-                        LOGGER.error("Unable to restore fan state for %s: %s", gpu_uuid, exc)
                 if control_succeeded:
                     self._fan_restored.add(gpu_uuid)
-                gpu["fan_control"] = self._fan_payload(gpu_uuid, state)
+                gpu["fan_control"] = self._fan_payload(gpu_uuid, profile)
 
-    def set_fan_control(
-        self,
-        gpu_uuid: str,
-        mode: str,
-        target_percent: int | None,
-        expected_revision: int,
-    ) -> dict[str, Any]:
-        if mode not in {"auto", "manual"}:
-            raise HTTPException(status_code=422, detail="mode must be auto or manual")
-        config = self.config.fan_control
-        if mode == "manual":
-            if target_percent is None:
+    def _validate_fan_profile_request(
+        self, request: FanProfileRequest
+    ) -> list[dict[str, Any]]:
+        step = self.config.fan_control.step_percent
+        if request.minimum_percent >= request.maximum_percent:
+            raise HTTPException(
+                status_code=422,
+                detail="minimum_percent must be below maximum_percent",
+            )
+        if (
+            request.maximum_percent - request.minimum_percent
+        ) % step:
+            raise HTTPException(
+                status_code=422,
+                detail="fan range must be divisible by step_percent",
+            )
+        if request.idle_duration_seconds <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail="idle_duration_seconds must be greater than zero",
+            )
+
+        points = [
+            {
+                "temperature_celsius": float(point.temperature_celsius),
+                "fan_percent": int(point.fan_percent),
+            }
+            for point in request.curve_points
+        ]
+        points.sort(key=lambda item: item["temperature_celsius"])
+        seen_temps: set[float] = set()
+        previous_fan: int | None = None
+        for point in points:
+            temperature = point["temperature_celsius"]
+            fan_percent = point["fan_percent"]
+            if temperature in seen_temps:
                 raise HTTPException(
                     status_code=422,
-                    detail="target_percent is required in manual mode",
+                    detail="curve temperatures must be unique",
                 )
+            seen_temps.add(temperature)
             if (
-                target_percent < config.minimum_percent
-                or target_percent > config.maximum_percent
-                or (target_percent - config.minimum_percent) % config.step_percent
+                fan_percent < request.minimum_percent
+                or fan_percent > request.maximum_percent
+                or (fan_percent - request.minimum_percent) % step
             ):
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        f"target_percent must be {config.minimum_percent}-"
-                        f"{config.maximum_percent} in {config.step_percent}% steps"
+                        f"fan_percent must be {request.minimum_percent}-"
+                        f"{request.maximum_percent} in {step}% steps"
                     ),
                 )
-        else:
-            target_percent = None
+            if previous_fan is not None and fan_percent < previous_fan:
+                raise HTTPException(
+                    status_code=422,
+                    detail="curve fan percents must be non-decreasing with temperature",
+                )
+            previous_fan = fan_percent
+        return points
 
+    def set_fan_profile(
+        self, gpu_uuid: str, request: FanProfileRequest
+    ) -> dict[str, Any]:
+        points = self._validate_fan_profile_request(request)
         with self._fan_control_lock:
-            state = self.database.get_fan_control_state(gpu_uuid)
-            if state is None:
+            profile = self.database.get_fan_profile(gpu_uuid)
+            if profile is None:
                 raise HTTPException(status_code=404, detail="GPU not found")
-            runtime = self._runtime_for_gpu(gpu_uuid)
-            current = self._fan_payload(gpu_uuid, state)
-            if int(state["revision"]) != expected_revision:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"message": "Fan state changed", "fan_control": current},
-                )
-            if not runtime["supported"]:
-                raise HTTPException(
-                    status_code=503,
-                    detail=runtime.get("error") or "Fan control is unavailable",
-                )
-            if mode == "manual" and runtime["idle_locked"]:
+            current = self._fan_payload(gpu_uuid, profile)
+            if int(profile["revision"]) != request.expected_revision:
                 raise HTTPException(
                     status_code=409,
                     detail={
-                        "message": (
-                            "Manual control is locked while the GPU is idle "
-                            "and below the temperature threshold"
-                        ),
+                        "message": "Fan profile changed",
                         "fan_control": current,
                     },
                 )
-            try:
-                if mode == "manual":
-                    self.fan_controller.set_manual(gpu_uuid, int(target_percent))
-                else:
-                    self.fan_controller.set_auto(gpu_uuid)
-            except FanControlError as exc:
-                runtime["error"] = str(exc)
-                raise HTTPException(status_code=503, detail=str(exc)) from exc
-            updated = self.database.update_fan_control_state(
-                gpu_uuid, mode, target_percent, expected_revision
+            updated = self.database.update_fan_profile(
+                gpu_uuid,
+                minimum_percent=request.minimum_percent,
+                maximum_percent=request.maximum_percent,
+                idle_temperature_celsius=request.idle_temperature_celsius,
+                idle_duration_seconds=request.idle_duration_seconds,
+                curve_points=points,
+                expected_revision=request.expected_revision,
             )
             if updated is None:
-                latest = self.database.get_fan_control_state(gpu_uuid)
+                latest = self.database.get_fan_profile(gpu_uuid)
                 raise HTTPException(
                     status_code=409,
                     detail={
-                        "message": "Fan state changed",
+                        "message": "Fan profile changed",
                         "fan_control": (
                             self._fan_payload(gpu_uuid, latest)
                             if latest is not None
@@ -464,7 +498,18 @@ class SentinelService:
                         ),
                     },
                 )
-            runtime["error"] = None
+
+            runtime = self._runtime_for_gpu(gpu_uuid)
+            runtime["applied_percent"] = None
+            runtime["last_written_percent"] = None
+            if not points and runtime["supported"]:
+                try:
+                    self.fan_controller.set_auto(gpu_uuid)
+                    runtime["error"] = None
+                except FanControlError as exc:
+                    runtime["error"] = str(exc)
+                    raise HTTPException(status_code=503, detail=str(exc)) from exc
+
             payload = self._fan_payload(gpu_uuid, updated)
             with self._snapshot_lock:
                 for gpu in self._snapshot["gpus"]:
@@ -472,6 +517,37 @@ class SentinelService:
                         gpu["fan_control"] = copy.deepcopy(payload)
                         break
             return payload
+
+    def list_user_settings(self) -> dict[str, Any]:
+        return {
+            "users": self.database.list_user_settings(active_only=True),
+            "last_sync": self._user_sync_result,
+        }
+
+    def sync_users(self) -> dict[str, Any]:
+        self._user_sync_result = sync_user_settings(self.database)
+        self._last_user_sync = time.monotonic()
+        return {
+            "users": self.database.list_user_settings(active_only=True),
+            "last_sync": self._user_sync_result,
+        }
+
+    def update_user_settings(
+        self, username: str, request: UserSettingsUpdateRequest
+    ) -> dict[str, Any]:
+        updated = self.database.update_user_setting(
+            username,
+            email=request.email,
+            is_admin=request.is_admin,
+            notify_temperature=request.notify_temperature,
+            notify_process_end=request.notify_process_end,
+        )
+        if updated is None:
+            raise HTTPException(
+                status_code=404,
+                detail="User not found or inactive on this system",
+            )
+        return updated
 
     def snapshot(self, key: str) -> Any:
         with self._snapshot_lock:
@@ -530,16 +606,11 @@ def create_app(config: Config) -> FastAPI:
     def gpus() -> list[dict[str, Any]]:
         return service.snapshot("gpus")
 
-    @application.put("/api/gpus/{gpu_uuid}/fan-control")
-    def set_gpu_fan_control(
-        gpu_uuid: str, request: FanControlRequest
+    @application.put("/api/gpus/{gpu_uuid}/fan-profile")
+    def set_gpu_fan_profile(
+        gpu_uuid: str, request: FanProfileRequest
     ) -> dict[str, Any]:
-        return service.set_fan_control(
-            gpu_uuid,
-            request.mode,
-            request.target_percent,
-            request.expected_revision,
-        )
+        return service.set_fan_profile(gpu_uuid, request)
 
     @application.get("/api/gpu-processes")
     def gpu_processes() -> list[dict[str, Any]]:
@@ -548,6 +619,20 @@ def create_app(config: Config) -> FastAPI:
     @application.get("/api/users")
     def users() -> list[dict[str, Any]]:
         return service.snapshot("users")
+
+    @application.get("/api/settings/users")
+    def settings_users() -> dict[str, Any]:
+        return service.list_user_settings()
+
+    @application.post("/api/settings/users/sync")
+    def settings_users_sync() -> dict[str, Any]:
+        return service.sync_users()
+
+    @application.patch("/api/settings/users/{username}")
+    def settings_users_update(
+        username: str, request: UserSettingsUpdateRequest
+    ) -> dict[str, Any]:
+        return service.update_user_settings(username, request)
 
     @application.get("/api/disks")
     def disks() -> list[dict[str, Any]]:

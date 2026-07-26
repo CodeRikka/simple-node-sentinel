@@ -11,6 +11,9 @@ let diskView = "physical";
 let latestDisks = [];
 let latestUsers = [];
 let showSystemUsers = false;
+let latestUserSettings = null;
+let userSettingsEditing = false;
+let openFanEditorUuid = null;
 
 const COLORS = {
   cyan: "#22d3ee",
@@ -169,14 +172,150 @@ function createFanIcon() {
   return svg;
 }
 
-function updateFanSliderProgress(nodes) {
-  const minimum = Number(nodes.slider.min);
-  const maximum = Number(nodes.slider.max);
-  const value = Number(nodes.slider.value);
-  const progress = maximum > minimum
-    ? (value - minimum) / (maximum - minimum) * 100
-    : 0;
-  nodes.slider.style.setProperty("--slider-progress", `${progress}%`);
+function clonePoints(points) {
+  return (points || []).map((point) => ({
+    temperature_celsius: Number(point.temperature_celsius),
+    fan_percent: Number(point.fan_percent),
+  }));
+}
+
+function sortedPoints(points) {
+  return clonePoints(points)
+    .sort((left, right) => left.temperature_celsius - right.temperature_celsius);
+}
+
+function profileFromState(state) {
+  return {
+    minimum_percent: state.minimum_percent ?? 30,
+    maximum_percent: state.maximum_percent ?? 100,
+    idle_temperature_celsius: state.idle_temperature_celsius ?? 60,
+    idle_duration_seconds: state.idle_duration_seconds ?? 20,
+    step_percent: state.step_percent ?? 5,
+    curve_points: clonePoints(state.curve_points),
+    revision: state.revision ?? 0,
+  };
+}
+
+function drawFanCurve(svg, profile, options = {}) {
+  const namespace = "http://www.w3.org/2000/svg";
+  svg.replaceChildren();
+  svg.setAttribute("viewBox", "0 0 640 160");
+  svg.classList.add("timeseries-svg");
+
+  const left = 38;
+  const right = 12;
+  const top = 12;
+  const bottom = 26;
+  const width = 640 - left - right;
+  const height = 160 - top - bottom;
+  const minFan = Number(profile.minimum_percent) || 0;
+  const maxFan = Number(profile.maximum_percent) || 100;
+  const points = sortedPoints(profile.curve_points);
+  const maxTemp = Math.max(100, ...points.map((point) => point.temperature_celsius), 80);
+
+  for (const value of [0, 50, 100]) {
+    const y = top + height - (value / 100) * height;
+    const line = document.createElementNS(namespace, "line");
+    line.setAttribute("x1", left);
+    line.setAttribute("x2", left + width);
+    line.setAttribute("y1", y);
+    line.setAttribute("y2", y);
+    line.classList.add("chart-grid");
+    svg.appendChild(line);
+    const mapped = minFan + (maxFan - minFan) * (value / 100);
+    const label = document.createElementNS(namespace, "text");
+    label.setAttribute("x", left - 7);
+    label.setAttribute("y", y + 4);
+    label.setAttribute("text-anchor", "end");
+    label.classList.add("chart-axis");
+    label.textContent = String(Math.round(mapped));
+    svg.appendChild(label);
+  }
+
+  const axisLabel = (x, y, text, anchor) => {
+    const node = document.createElementNS(namespace, "text");
+    node.setAttribute("x", x);
+    node.setAttribute("y", y);
+    node.setAttribute("text-anchor", anchor);
+    node.classList.add("chart-axis");
+    node.textContent = text;
+    svg.appendChild(node);
+  };
+  axisLabel(left, 154, "0°C", "start");
+  axisLabel(left + width, 154, `${Math.round(maxTemp)}°C`, "end");
+
+  if (!points.length) {
+    const empty = document.createElementNS(namespace, "text");
+    empty.setAttribute("x", 320);
+    empty.setAttribute("y", 86);
+    empty.setAttribute("text-anchor", "middle");
+    empty.classList.add("empty-chart");
+    empty.textContent = options.emptyText || "Empty curve · NVIDIA automatic";
+    svg.appendChild(empty);
+    return;
+  }
+
+  const xAt = (temperature) => left + (temperature / maxTemp) * width;
+  const yAt = (fan) => {
+    const span = Math.max(1, maxFan - minFan);
+    const normalized = Math.max(0, Math.min(1, (fan - minFan) / span));
+    return top + height - normalized * height;
+  };
+
+  let pathData = `M ${xAt(0).toFixed(2)} ${yAt(minFan).toFixed(2)}`;
+  let current = minFan;
+  points.forEach((point) => {
+    pathData += ` L ${xAt(point.temperature_celsius).toFixed(2)} ${yAt(current).toFixed(2)}`;
+    current = point.fan_percent;
+    pathData += ` L ${xAt(point.temperature_celsius).toFixed(2)} ${yAt(current).toFixed(2)}`;
+  });
+  pathData += ` L ${xAt(maxTemp).toFixed(2)} ${yAt(current).toFixed(2)}`;
+
+  const path = document.createElementNS(namespace, "path");
+  path.setAttribute("d", pathData);
+  path.setAttribute("stroke", COLORS.cyan);
+  path.classList.add("chart-line");
+  svg.appendChild(path);
+
+  points.forEach((point) => {
+    const circle = document.createElementNS(namespace, "circle");
+    circle.setAttribute("cx", xAt(point.temperature_celsius));
+    circle.setAttribute("cy", yAt(point.fan_percent));
+    circle.setAttribute("r", "3.2");
+    circle.setAttribute("fill", COLORS.cyan);
+    circle.setAttribute("stroke", "#0d1621");
+    circle.setAttribute("stroke-width", "1.5");
+    svg.appendChild(circle);
+  });
+}
+
+function createCurveChartBlock(title) {
+  const block = textElement("div", "chart-block fan-curve-chart", "");
+  block.appendChild(textElement("div", "chart-title", title));
+  const legend = textElement("div", "chart-legend", "");
+  const item = textElement("span", "legend-item", "");
+  const swatch = document.createElement("i");
+  swatch.style.background = COLORS.cyan;
+  item.append(swatch, document.createTextNode("Fan curve"));
+  legend.appendChild(item);
+  const chart = textElement("div", "chart", "");
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", title);
+  chart.appendChild(svg);
+  block.append(legend, chart);
+  return { block, svg, legendItem: item };
+}
+
+function updateCurveLegend(legendItem, profile) {
+  const points = sortedPoints(profile.curve_points);
+  const label = points.length
+    ? `Fan curve · ${points.length} point${points.length === 1 ? "" : "s"}`
+    : "Fan curve · automatic";
+  legendItem.replaceChildren();
+  const swatch = document.createElement("i");
+  swatch.style.background = COLORS.cyan;
+  legendItem.append(swatch, document.createTextNode(label));
 }
 
 function createFanControl(gpu) {
@@ -187,46 +326,30 @@ function createFanControl(gpu) {
   const actual = textElement("strong", "", "N/A");
   visual.append(icon, actual);
 
-  const switchLabel = textElement("label", "fan-switch", "");
-  const checkbox = document.createElement("input");
-  checkbox.type = "checkbox";
-  checkbox.setAttribute("role", "switch");
-  const switchTrack = textElement("span", "fan-switch-track", "");
-  const modeLabel = textElement("span", "", "Automatic");
-  switchLabel.append(checkbox, switchTrack, modeLabel);
-  header.append(visual, switchLabel);
+  const summary = textElement("div", "fan-summary", "");
+  const modeBadge = textElement("span", "fan-mode-badge", "Automatic");
+  const editButton = document.createElement("button");
+  editButton.type = "button";
+  editButton.className = "small-button";
+  editButton.textContent = "Edit curve";
+  summary.append(modeBadge, editButton);
+  header.append(visual, summary);
 
-  const sliderRow = textElement("label", "fan-slider-row", "");
-  const sliderLabel = textElement("span", "", "Manual target");
-  const sliderShell = textElement("span", "fan-slider-shell", "");
-  const slider = document.createElement("input");
-  slider.type = "range";
-  const ticks = textElement("span", "fan-slider-ticks", "");
-  sliderShell.append(slider, ticks);
-  const target = textElement("strong", "", "60%");
-  sliderRow.append(sliderLabel, sliderShell, target);
+  const chart = createCurveChartBlock("Fan response curve");
   const message = textElement("p", "fan-control-message", "");
-  control.append(header, sliderRow, message);
+  control.append(header, chart.block, message);
 
-  const state = {
-    checkbox, modeLabel, slider, ticks, target, message, icon, actual,
-    pending: false, editing: false, latest: gpu,
+  const state = gpu.fan_control || {};
+  const nodes = {
+    modeBadge, message, icon, actual, editButton,
+    preview: chart.svg, legendItem: chart.legendItem,
+    pending: false, latest: gpu,
+    profile: profileFromState(state),
   };
-  fanControls.set(gpu.uuid, state);
-  slider.addEventListener("input", () => {
-    state.editing = true;
-    target.textContent = `${slider.value}%`;
-    updateFanSliderProgress(state);
-  });
-  slider.addEventListener("change", () => {
-    state.editing = false;
-    if (checkbox.checked) submitFanControl(gpu.uuid, "manual", Number(slider.value));
-  });
-  checkbox.addEventListener("change", () => {
-    const mode = checkbox.checked ? "manual" : "auto";
-    const percent = checkbox.checked ? Number(slider.value) : null;
-    submitFanControl(gpu.uuid, mode, percent);
-  });
+  fanControls.set(gpu.uuid, nodes);
+  editButton.addEventListener("click", () => openFanEditor(gpu.uuid));
+  drawFanCurve(nodes.preview, nodes.profile);
+  updateCurveLegend(nodes.legendItem, nodes.profile);
   return control;
 }
 
@@ -236,33 +359,19 @@ function updateFanControl(gpu, overrideMessage = null) {
   nodes.latest = gpu;
   const state = gpu.fan_control || {};
   const supported = Boolean(state.supported);
-  const manual = state.mode === "manual";
-  nodes.checkbox.checked = manual;
-  nodes.modeLabel.textContent = manual ? "Manual" : "Automatic";
-  nodes.slider.min = state.minimum_percent ?? 60;
-  nodes.slider.max = state.maximum_percent ?? 90;
-  nodes.slider.step = state.step_percent ?? 5;
-  const tickSignature = `${nodes.slider.min}:${nodes.slider.max}:${nodes.slider.step}`;
-  if (nodes.ticks.dataset.signature !== tickSignature) {
-    nodes.ticks.dataset.signature = tickSignature;
-    nodes.ticks.replaceChildren();
-    const count = (
-      (Number(nodes.slider.max) - Number(nodes.slider.min))
-      / Number(nodes.slider.step)
-    ) + 1;
-    for (let index = 0; index < count; index += 1) {
-      nodes.ticks.appendChild(textElement("i", "", ""));
-    }
+  nodes.profile = profileFromState(state);
+  drawFanCurve(nodes.preview, nodes.profile);
+  updateCurveLegend(nodes.legendItem, nodes.profile);
+
+  const mode = state.mode === "curve" ? "Curve" : "Automatic";
+  const applied = state.applied_percent == null ? "" : ` · ${state.applied_percent}%`;
+  nodes.modeBadge.textContent = `${mode}${applied}`;
+  nodes.editButton.disabled = nodes.pending || !supported;
+  if (!supported) {
+    nodes.editButton.title = state.error || "Fan control unavailable";
+  } else {
+    nodes.editButton.removeAttribute("title");
   }
-  if (!nodes.editing && !nodes.pending) {
-    nodes.slider.value = state.target_percent ?? nodes.slider.min;
-    nodes.target.textContent = `${nodes.slider.value}%`;
-  }
-  updateFanSliderProgress(nodes);
-  nodes.checkbox.disabled = (
-    nodes.pending || !supported || (!state.manual_allowed && !manual)
-  );
-  nodes.slider.disabled = nodes.pending || !supported || !state.manual_allowed || !manual;
 
   const speed = Number(gpu.fan_percent);
   nodes.actual.textContent = formatPercent(gpu.fan_percent);
@@ -281,12 +390,6 @@ function updateFanControl(gpu, overrideMessage = null) {
   if (overrideMessage) {
     nodes.message.textContent = overrideMessage;
     nodes.message.className = "fan-control-message error";
-  } else if (state.emergency_active) {
-    nodes.message.textContent = (
-      `Above ${state.emergency_temperature_celsius ?? 83}°C — `
-      + `high-temperature fan protection is active at ${state.emergency_fan_percent ?? 80}% or higher.`
-    );
-    nodes.message.className = "fan-control-message warning";
   } else if (state.idle_locked) {
     nodes.message.textContent = (
       `Idle below ${state.idle_temperature_celsius ?? 60}°C — `
@@ -305,10 +408,409 @@ function updateFanControl(gpu, overrideMessage = null) {
   } else if (state.error) {
     nodes.message.textContent = state.error;
     nodes.message.className = "fan-control-message error";
+  } else if (!(state.curve_points || []).length) {
+    nodes.message.textContent = "Empty curve uses NVIDIA automatic fan control.";
+    nodes.message.className = "fan-control-message";
   } else {
-    nodes.message.textContent = nodes.pending ? "Applying…" : "";
+    nodes.message.textContent = "";
     nodes.message.className = "fan-control-message";
   }
+
+  if (openFanEditorUuid === gpu.uuid) {
+    const dialog = $("#fan-editor-dialog");
+    if (dialog && !dialog.dataset.dirty) {
+      dialog.dataset.revision = String(state.revision ?? 0);
+    }
+  }
+}
+
+function closeFanEditor() {
+  openFanEditorUuid = null;
+  $("#modal-root").replaceChildren();
+  document.body.style.overflow = "";
+}
+
+function openFanEditor(gpuUuid) {
+  const nodes = fanControls.get(gpuUuid);
+  if (!nodes || nodes.pending) return;
+  const gpu = nodes.latest;
+  const state = gpu.fan_control || {};
+  if (!state.supported) return;
+
+  openFanEditorUuid = gpuUuid;
+  const draft = profileFromState(state);
+  const root = $("#modal-root");
+  root.replaceChildren();
+  document.body.style.overflow = "hidden";
+
+  const backdrop = textElement("div", "modal-backdrop", "");
+  backdrop.setAttribute("role", "presentation");
+  const dialog = textElement("div", "modal-dialog", "");
+  dialog.id = "fan-editor-dialog";
+  dialog.dataset.dirty = "";
+  dialog.dataset.revision = String(draft.revision);
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-labelledby", "fan-editor-title");
+
+  const header = textElement("div", "modal-header", "");
+  const heading = textElement("div", "", "");
+  heading.append(
+    textElement("h3", "", "Edit fan curve"),
+    textElement(
+      "p",
+      "modal-subtitle",
+      `GPU ${gpu.index} · ${gpu.name || gpu.uuid}`,
+    ),
+  );
+  heading.querySelector("h3").id = "fan-editor-title";
+  const closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.className = "modal-close";
+  closeButton.setAttribute("aria-label", "Close without saving");
+  closeButton.textContent = "×";
+  header.append(heading, closeButton);
+
+  const limits = textElement("div", "fan-limits", "");
+  const fields = [
+    ["minimum_percent", "Min fan %"],
+    ["maximum_percent", "Max fan %"],
+    ["idle_temperature_celsius", "Idle below °C"],
+    ["idle_duration_seconds", "Idle duration s"],
+  ].map(([key, labelText]) => {
+    const label = textElement("label", "", labelText);
+    const input = document.createElement("input");
+    input.type = "number";
+    input.dataset.field = key;
+    input.value = String(draft[key]);
+    label.appendChild(input);
+    limits.appendChild(label);
+    return input;
+  });
+
+  const chart = createCurveChartBlock("Preview");
+  const points = textElement("div", "fan-curve-points", "");
+  const actions = textElement("div", "modal-actions", "");
+  const leftActions = textElement("div", "modal-actions-left", "");
+  const rightActions = textElement("div", "modal-actions-right", "");
+  const addButton = document.createElement("button");
+  addButton.type = "button";
+  addButton.className = "small-button";
+  addButton.textContent = "Add point";
+  const discardButton = document.createElement("button");
+  discardButton.type = "button";
+  discardButton.className = "small-button";
+  discardButton.textContent = "Don't save";
+  const saveButton = document.createElement("button");
+  saveButton.type = "button";
+  saveButton.className = "small-button primary";
+  saveButton.textContent = "Save";
+  leftActions.appendChild(addButton);
+  rightActions.append(discardButton, saveButton);
+  actions.append(leftActions, rightActions);
+  const message = textElement("p", "fan-control-message", "");
+
+  dialog.append(header, limits, chart.block, points, actions, message);
+  backdrop.appendChild(dialog);
+  root.appendChild(backdrop);
+
+  const editor = { draft, fields, points, preview: chart.svg, legendItem: chart.legendItem, message, saveButton };
+
+  const markDirty = () => {
+    dialog.dataset.dirty = "1";
+  };
+
+  const refreshPreview = () => {
+    drawFanCurve(editor.preview, editor.draft);
+    updateCurveLegend(editor.legendItem, editor.draft);
+  };
+
+  const renderPoints = () => {
+    editor.draft.curve_points = sortedPoints(editor.draft.curve_points);
+    editor.points.replaceChildren();
+    if (!editor.draft.curve_points.length) {
+      editor.points.appendChild(
+        textElement("p", "fan-point-empty", "No points — saving will use NVIDIA automatic mode."),
+      );
+      refreshPreview();
+      return;
+    }
+    editor.draft.curve_points.forEach((point, index) => {
+      const row = textElement("div", "fan-point-row", "");
+      const tempLabel = textElement("label", "", "Temperature °C");
+      const tempInput = document.createElement("input");
+      tempInput.type = "number";
+      tempInput.min = "0";
+      tempInput.max = "120";
+      tempInput.step = "1";
+      tempInput.value = String(point.temperature_celsius);
+      tempLabel.appendChild(tempInput);
+      const fanLabel = textElement("label", "", "Fan %");
+      const fanInput = document.createElement("input");
+      fanInput.type = "number";
+      fanInput.min = String(editor.draft.minimum_percent);
+      fanInput.max = String(editor.draft.maximum_percent);
+      fanInput.step = String(editor.draft.step_percent || 5);
+      fanInput.value = String(point.fan_percent);
+      fanLabel.appendChild(fanInput);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "small-button danger-quiet";
+      remove.textContent = "Remove";
+      const readDomPoints = () => [...editor.points.querySelectorAll(".fan-point-row")].map((item) => {
+        const inputs = item.querySelectorAll("input");
+        return {
+          temperature_celsius: Number(inputs[0].value),
+          fan_percent: Number(inputs[1].value),
+        };
+      });
+      const syncDraft = (resort = false) => {
+        markDirty();
+        editor.draft.curve_points = readDomPoints();
+        if (resort) renderPoints();
+        else refreshPreview();
+      };
+      tempInput.addEventListener("change", () => syncDraft(true));
+      tempInput.addEventListener("input", () => syncDraft(false));
+      fanInput.addEventListener("input", () => syncDraft(false));
+      remove.addEventListener("click", () => {
+        markDirty();
+        editor.draft.curve_points = readDomPoints().filter((_, itemIndex) => itemIndex !== index);
+        renderPoints();
+      });
+      row.append(tempLabel, fanLabel, remove);
+      editor.points.appendChild(row);
+    });
+    refreshPreview();
+  };
+
+  fields.forEach((input) => {
+    input.addEventListener("input", () => {
+      markDirty();
+      editor.draft[input.dataset.field] = Number(input.value);
+      renderPoints();
+    });
+  });
+  addButton.addEventListener("click", () => {
+    markDirty();
+    const existing = sortedPoints(editor.draft.curve_points);
+    const last = existing[existing.length - 1];
+    const nextTemp = last ? last.temperature_celsius + 5 : 80;
+    const nextFan = last
+      ? Math.min(editor.draft.maximum_percent, last.fan_percent + (editor.draft.step_percent || 5))
+      : 80;
+    editor.draft.curve_points.push({
+      temperature_celsius: nextTemp,
+      fan_percent: nextFan,
+    });
+    renderPoints();
+  });
+
+  const cleanupAndClose = () => {
+    document.removeEventListener("keydown", onKeydown);
+    closeFanEditor();
+  };
+  const onKeydown = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cleanupAndClose();
+    }
+  };
+  document.addEventListener("keydown", onKeydown);
+  closeButton.addEventListener("click", cleanupAndClose);
+  discardButton.addEventListener("click", cleanupAndClose);
+  backdrop.addEventListener("click", (event) => {
+    if (event.target === backdrop) cleanupAndClose();
+  });
+  saveButton.addEventListener("click", async () => {
+    saveButton.disabled = true;
+    addButton.disabled = true;
+    discardButton.disabled = true;
+    editor.message.textContent = "Saving…";
+    editor.message.className = "fan-control-message";
+    try {
+      await submitFanProfile(gpuUuid, {
+        ...editor.draft,
+        curve_points: sortedPoints(editor.draft.curve_points),
+        expected_revision: Number(dialog.dataset.revision || draft.revision),
+      });
+      cleanupAndClose();
+    } catch (error) {
+      saveButton.disabled = false;
+      addButton.disabled = false;
+      discardButton.disabled = false;
+      if (error.detail?.fan_control) {
+        dialog.dataset.revision = String(error.detail.fan_control.revision ?? dialog.dataset.revision);
+      }
+      editor.message.textContent = error.status === 409
+        ? `Not saved: ${error.message}. Update from the latest revision and try again.`
+        : `Unable to save: ${error.message}`;
+      editor.message.className = "fan-control-message error";
+    }
+  });
+
+  renderPoints();
+  fields[0]?.focus();
+}
+
+async function submitFanProfile(gpuUuid, payload) {
+  const nodes = fanControls.get(gpuUuid);
+  const control = nodes?.latest?.fan_control;
+  if (!nodes || !control) throw new Error("GPU fan control unavailable");
+  nodes.pending = true;
+  updateFanControl(nodes.latest);
+  try {
+    const updated = await request(`/api/gpus/${encodeURIComponent(gpuUuid)}/fan-profile`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        minimum_percent: Number(payload.minimum_percent),
+        maximum_percent: Number(payload.maximum_percent),
+        idle_temperature_celsius: Number(payload.idle_temperature_celsius),
+        idle_duration_seconds: Number(payload.idle_duration_seconds),
+        curve_points: payload.curve_points,
+        expected_revision: payload.expected_revision,
+      }),
+    });
+    nodes.latest.fan_control = updated;
+    nodes.pending = false;
+    updateFanControl(nodes.latest);
+    return updated;
+  } catch (error) {
+    nodes.pending = false;
+    if (error.detail?.fan_control) {
+      nodes.latest.fan_control = error.detail.fan_control;
+    }
+    updateFanControl(nodes.latest);
+    throw error;
+  }
+}
+
+function yesNo(value) {
+  const span = textElement(
+    "span",
+    `user-settings-flag ${value ? "on" : "off"}`,
+    value ? "Yes" : "No",
+  );
+  return span;
+}
+
+function setUserSettingsEditMode(editing) {
+  userSettingsEditing = editing;
+  const button = $("#user-settings-edit");
+  button.textContent = editing ? "Done" : "Edit";
+  button.setAttribute("aria-pressed", String(editing));
+  if (latestUserSettings) renderUserSettings(latestUserSettings);
+}
+
+function renderUserSettings(payload) {
+  latestUserSettings = payload;
+  const body = $("#user-settings tbody");
+  const users = payload?.users || [];
+  const sync = payload?.last_sync;
+  const meta = $("#user-settings-sync-meta");
+  const actionsCol = $("#user-settings .user-settings-actions-col");
+  if (sync?.synced_at) {
+    meta.textContent = (
+      `Last sync ${new Date(sync.synced_at * 1000).toLocaleString()} · `
+      + `${sync.active ?? users.length} active`
+    );
+  } else {
+    meta.textContent = "Synced Linux login users";
+  }
+  actionsCol.hidden = !userSettingsEditing;
+  document.getElementById("user-settings").classList.toggle(
+    "is-editing",
+    userSettingsEditing,
+  );
+  body.replaceChildren();
+  if (!users.length) {
+    const row = document.createElement("tr");
+    const cell = textElement("td", "empty", "No login users synced yet");
+    cell.colSpan = userSettingsEditing ? 6 : 5;
+    row.appendChild(cell);
+    body.appendChild(row);
+    return;
+  }
+  users.forEach((user) => {
+    const row = document.createElement("tr");
+    row.appendChild(textElement("td", "", user.username));
+
+    if (!userSettingsEditing) {
+      const emailCell = document.createElement("td");
+      emailCell.appendChild(
+        user.email
+          ? textElement("span", "user-settings-email-text", user.email)
+          : textElement("span", "user-settings-email-text muted", "Not set"),
+      );
+      const adminCell = document.createElement("td");
+      adminCell.appendChild(yesNo(user.is_admin));
+      const tempCell = document.createElement("td");
+      tempCell.appendChild(yesNo(user.notify_temperature));
+      const processCell = document.createElement("td");
+      processCell.appendChild(yesNo(user.notify_process_end));
+      row.append(emailCell, adminCell, tempCell, processCell);
+      body.appendChild(row);
+      return;
+    }
+
+    const emailCell = document.createElement("td");
+    const email = document.createElement("input");
+    email.className = "user-settings-email";
+    email.type = "email";
+    email.value = user.email || "";
+    email.placeholder = "name@example.com";
+    emailCell.appendChild(email);
+    row.appendChild(emailCell);
+
+    const makeCheck = (checked, label) => {
+      const cell = document.createElement("td");
+      const wrap = textElement("label", "user-settings-check", "");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = Boolean(checked);
+      wrap.append(input, document.createTextNode(label));
+      cell.appendChild(wrap);
+      return { cell, input };
+    };
+    const admin = makeCheck(user.is_admin, "Admin");
+    const temp = makeCheck(user.notify_temperature, "On");
+    const processEnd = makeCheck(user.notify_process_end, "On");
+    row.append(admin.cell, temp.cell, processEnd.cell);
+
+    const action = document.createElement("td");
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "small-button primary";
+    save.textContent = "Save";
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        await request(`/api/settings/users/${encodeURIComponent(user.username)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: email.value.trim() || null,
+            is_admin: admin.input.checked,
+            notify_temperature: temp.input.checked,
+            notify_process_end: processEnd.input.checked,
+          }),
+        });
+        await refreshUserSettings();
+      } catch (error) {
+        window.alert(`Unable to save ${user.username}: ${error.message}`);
+        save.disabled = false;
+      }
+    });
+    action.appendChild(save);
+    row.appendChild(action);
+    body.appendChild(row);
+  });
+}
+
+async function refreshUserSettings() {
+  const payload = await request("/api/settings/users");
+  renderUserSettings(payload);
 }
 
 function setupSystemCards() {
@@ -614,37 +1116,6 @@ async function request(path, options = {}) {
   return data;
 }
 
-async function submitFanControl(gpuUuid, mode, targetPercent) {
-  const nodes = fanControls.get(gpuUuid);
-  const control = nodes?.latest?.fan_control;
-  if (!nodes || !control || nodes.pending) return;
-  nodes.pending = true;
-  updateFanControl(nodes.latest);
-  try {
-    const updated = await request(`/api/gpus/${encodeURIComponent(gpuUuid)}/fan-control`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        mode,
-        target_percent: targetPercent,
-        expected_revision: control.revision,
-      }),
-    });
-    nodes.latest.fan_control = updated;
-    nodes.pending = false;
-    updateFanControl(nodes.latest);
-  } catch (error) {
-    nodes.pending = false;
-    if (error.detail?.fan_control) {
-      nodes.latest.fan_control = error.detail.fan_control;
-    }
-    const message = error.status === 409
-      ? `Not applied: ${error.message}. The latest state is shown.`
-      : `Unable to apply: ${error.message}`;
-    updateFanControl(nodes.latest, message);
-  }
-}
-
 async function refreshLive() {
   const [summary, gpus, processes, users, disks, alerts] = await Promise.all([
     request("/api/summary"), request("/api/gpus"), request("/api/gpu-processes"),
@@ -702,7 +1173,25 @@ $("#users-toggle").addEventListener("click", () => {
   showSystemUsers = !showSystemUsers;
   renderUsers(latestUsers);
 });
+$("#user-settings-sync").addEventListener("click", async () => {
+  const button = $("#user-settings-sync");
+  button.disabled = true;
+  try {
+    const payload = await request("/api/settings/users/sync", { method: "POST" });
+    renderUserSettings(payload);
+  } catch (error) {
+    window.alert(`Unable to sync users: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+});
+$("#user-settings-edit").addEventListener("click", () => {
+  setUserSettingsEditMode(!userSettingsEditing);
+});
 updateLive();
 refreshHistory();
+refreshUserSettings().catch((error) => {
+  console.error("Unable to load user settings", error);
+});
 setInterval(updateLive, 2000);
 setInterval(refreshHistory, 30000);
