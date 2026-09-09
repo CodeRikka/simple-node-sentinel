@@ -33,8 +33,12 @@ class TimeSeriesChart {
       label.setAttribute("aria-pressed", "false");
       const swatch = document.createElement("i");
       swatch.style.background = item.color;
-      const value = document.createElement("span");
-      label.append(swatch, value);
+      const name = document.createElement("span");
+      name.className = "legend-label";
+      name.textContent = item.label;
+      const value = document.createElement("strong");
+      value.className = "legend-value";
+      label.append(swatch, name, value);
       label.addEventListener("pointerenter", () => this.setHover(item.key));
       label.addEventListener("pointerleave", () => this.setHover(null));
       label.addEventListener("focus", () => {
@@ -120,7 +124,7 @@ class TimeSeriesChart {
         .map((point) => this.value(item, point))
         .find((value) => Number.isFinite(value));
       const label = `${item.label}${latest === undefined ? "" : ` ${item.format(latest)}`}`;
-      this.legendValues.get(item.key).textContent = label;
+      this.legendValues.get(item.key).textContent = latest === undefined ? "—" : item.format(latest);
       this.legendValues.get(item.key).parentElement.setAttribute("aria-label", `Highlight ${label}`);
     });
 

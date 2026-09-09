@@ -12,7 +12,7 @@
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
         <div>
-        <h1>Simple Node Sentinel</h1>
+          <h1>Simple Node Sentinel</h1>
           <p>Hardware health and workload overview</p>
         </div>
       </div>
@@ -70,7 +70,7 @@
         </div>
         <div class="table-wrap">
           <table id="gpu-processes">
-            <thead><tr><th>GPU</th><th>User</th><th>PID</th><th>GPU memory</th><th>CPU</th><th>RAM</th><th>Runtime</th><th>Command</th></tr></thead>
+            <thead><tr><th scope="col">GPU</th><th scope="col">User</th><th scope="col">PID</th><th scope="col">GPU memory</th><th scope="col">CPU</th><th scope="col">RAM</th><th scope="col">Runtime</th><th scope="col">Command</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
@@ -82,7 +82,7 @@
         </div>
         <div class="table-wrap">
           <table id="users">
-            <thead><tr><th>User</th><th>Processes</th><th>CPU</th><th>RAM</th><th>GPU processes</th><th>GPU memory</th></tr></thead>
+            <thead><tr><th scope="col">User</th><th scope="col">Processes</th><th scope="col">CPU</th><th scope="col">RAM</th><th scope="col">GPU processes</th><th scope="col">GPU memory</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
@@ -93,7 +93,7 @@
         </div>
         <div class="table-wrap">
           <table id="alerts">
-            <thead><tr><th>GPU</th><th>Triggered</th><th>Status</th><th>Current</th><th>Maximum</th><th>Users</th><th>Email</th></tr></thead>
+            <thead><tr><th scope="col">GPU</th><th scope="col">Triggered</th><th scope="col">Status</th><th scope="col">Current</th><th scope="col">Maximum</th><th scope="col">Users</th><th scope="col">Email</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
@@ -111,12 +111,12 @@
           <table id="user-settings">
             <thead>
               <tr>
-                <th>User</th>
-                <th>Email</th>
-                <th>Admin</th>
-                <th>Temp alert</th>
-                <th>Process end</th>
-                <th class="user-settings-actions-col"></th>
+                <th scope="col">User</th>
+                <th scope="col">Email</th>
+                <th scope="col">Admin</th>
+                <th scope="col">Temp alert</th>
+                <th scope="col">Process end</th>
+                <th scope="col" aria-label="Actions" class="user-settings-actions-col"></th>
               </tr>
             </thead>
             <tbody></tbody>

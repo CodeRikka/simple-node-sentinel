@@ -62,6 +62,27 @@ sudoedit /etc/simple-node-sentinel/config.yaml
 sudoedit /etc/simple-node-sentinel/smtp-password
 ```
 
+To fill or replace the SMTP password using the interactive script, run it in
+a terminal with sudo (the production password is owned by root with mode
+`600`):
+
+```bash
+sudo /opt/simple-node-sentinel/venv/bin/python \
+  /opt/simple-node-sentinel/scripts/configure_interactively.py \
+  --config /etc/simple-node-sentinel/config.yaml
+sudo systemctl restart simple-node-sentinel.service
+```
+
+Do not add `</dev/null` to this command: that is used for unattended code
+updates and skips configuration. If testing a fix from a local checkout,
+replace the script path with that checkout's `scripts/configure_interactively.py`;
+the installed virtual environment can still provide Python and its dependencies.
+The script explicitly asks before replacing an existing password. Input stays
+hidden; Enter keeps the old value, and successful writes report the destination
+and mode without displaying the password. It offers to enable email only once
+a non-empty password is available. A saved password does not verify SMTP login
+or delivery.
+
 The password file must contain only the SMTP password or app password, with no
 quotes. User emails, admin flags and process-end notification toggles are
 stored in the database and edited under **User settings** in the dashboard.

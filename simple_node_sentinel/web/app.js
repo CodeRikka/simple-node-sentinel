@@ -153,7 +153,10 @@ function clearCards(prefix) {
       charts.delete(key);
     }
   }
-  if (prefix === "gpu") fanControls.clear();
+  if (prefix === "gpu") {
+    fanControls.forEach((nodes) => nodes.preview.resizeObserver?.disconnect());
+    fanControls.clear();
+  }
 }
 
 function fanColor(temperature) {
@@ -215,9 +218,11 @@ function profileFromState(state) {
 }
 
 function drawFanCurve(svg, profile, options = {}) {
+  svg.curveProfile = profile;
+  svg.curveOptions = options;
   const namespace = "http://www.w3.org/2000/svg";
   svg.replaceChildren();
-  const viewWidth = Math.max(280, svg.parentElement?.clientWidth || 640);
+  const viewWidth = Math.max(240, svg.parentElement?.clientWidth || 640);
   svg.setAttribute("viewBox", `0 0 ${viewWidth} 160`);
   svg.classList.add("timeseries-svg");
 
@@ -361,6 +366,13 @@ function createCurveChartBlock(title) {
   block.addEventListener("pointerleave", () => highlight(null));
   block.addEventListener("focusin", (event) => highlight(event.target.dataset.series || null));
   block.addEventListener("focusout", () => highlight(null));
+  svg.resizeObserver = new ResizeObserver(() => {
+    const width = Math.max(240, chart.clientWidth || 640);
+    if (svg.curveProfile && width !== svg.viewBox.baseVal.width) {
+      drawFanCurve(svg, svg.curveProfile, svg.curveOptions);
+    }
+  });
+  svg.resizeObserver.observe(chart);
   return { block, svg, legendItem: item };
 }
 
@@ -467,6 +479,7 @@ function updateFanControl(gpu, overrideMessage = null) {
 
 function closeFanEditor() {
   openFanEditorUuid = null;
+  $("#modal-root").querySelectorAll("svg").forEach((svg) => svg.resizeObserver?.disconnect());
   $("#modal-root").replaceChildren();
   document.body.style.overflow = "";
 }
@@ -481,6 +494,7 @@ function openFanEditor(gpuUuid) {
   openFanEditorUuid = gpuUuid;
   const draft = profileFromState(state);
   const root = $("#modal-root");
+  root.querySelectorAll("svg").forEach((svg) => svg.resizeObserver?.disconnect());
   root.replaceChildren();
   document.body.style.overflow = "hidden";
 
@@ -798,24 +812,26 @@ function renderUserSettings(payload) {
     const email = document.createElement("input");
     email.className = "user-settings-email";
     email.type = "email";
+    email.setAttribute("aria-label", `Email address for ${user.username}`);
     email.value = user.email || "";
     email.placeholder = "name@example.com";
     emailCell.appendChild(email);
     row.appendChild(emailCell);
 
-    const makeCheck = (checked, label) => {
+    const makeCheck = (checked, label, setting) => {
       const cell = document.createElement("td");
       const wrap = textElement("label", "user-settings-check", "");
       const input = document.createElement("input");
       input.type = "checkbox";
       input.checked = Boolean(checked);
+      input.setAttribute("aria-label", `${setting} for ${user.username}`);
       wrap.append(input, document.createTextNode(label));
       cell.appendChild(wrap);
       return { cell, input };
     };
-    const admin = makeCheck(user.is_admin, "Admin");
-    const temp = makeCheck(user.notify_temperature, "On");
-    const processEnd = makeCheck(user.notify_process_end, "On");
+    const admin = makeCheck(user.is_admin, "Admin", "Administrator");
+    const temp = makeCheck(user.notify_temperature, "On", "Temperature alerts");
+    const processEnd = makeCheck(user.notify_process_end, "On", "Process-end notifications");
     row.append(admin.cell, temp.cell, processEnd.cell);
 
     const action = document.createElement("td");
