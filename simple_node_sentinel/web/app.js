@@ -16,11 +16,11 @@ let userSettingsEditing = false;
 let openFanEditorUuid = null;
 
 const COLORS = {
-  cyan: "#22d3ee",
-  violet: "#a78bfa",
-  emerald: "#34d399",
-  amber: "#fbbf24",
-  rose: "#fb7185",
+  blue: "var(--chart-blue)",
+  teal: "var(--chart-teal)",
+  violet: "var(--chart-violet)",
+  coral: "var(--chart-coral)",
+  slate: "var(--chart-slate)",
 };
 
 function formatBytes(value) {
@@ -96,7 +96,7 @@ function createMetricCard(key, title, subtitle, rows, chartDefinitions) {
 
   const metrics = textElement("div", "metric-grid", "");
   rows.filter((row) => !row.primary).forEach((item) => {
-    const row = textElement("div", "metric", "");
+    const row = textElement("div", item.id === "workloads" ? "metric workload-metric" : "metric", "");
     row.appendChild(textElement("span", "label", item.label));
     const value = textElement("strong", "", "N/A");
     metricNodes.set(`${key}:${item.id}`, value);
@@ -105,12 +105,15 @@ function createMetricCard(key, title, subtitle, rows, chartDefinitions) {
   });
   element.appendChild(metrics);
 
+  const chartContainer = key.startsWith("gpu:")
+    ? textElement("div", "gpu-history", "") : element;
+  if (chartContainer !== element) element.appendChild(chartContainer);
   chartDefinitions.forEach((definition) => {
     const block = textElement("div", "chart-block", "");
     if (definition.title) block.appendChild(textElement("span", "chart-title", definition.title));
     const holder = textElement("div", "chart", "");
     block.appendChild(holder);
-    element.appendChild(block);
+    chartContainer.appendChild(block);
     charts.set(
       `${key}:${definition.id}`,
       new window.TimeSeriesChart(holder, {
@@ -118,6 +121,19 @@ function createMetricCard(key, title, subtitle, rows, chartDefinitions) {
         series: definition.series,
       }),
     );
+  });
+  rows.filter((row) => row.highlight).forEach((row) => {
+    const value = metricNodes.get(`${key}:${row.id}`);
+    const target = row.primary ? value : value.parentElement;
+    target.tabIndex = 0;
+    target.classList.add("chart-metric");
+    const chart = charts.get(`${key}:${row.highlight[0]}`);
+    target.addEventListener("pointerenter", () => chart.setExternalHighlight(row.highlight[1]));
+    target.addEventListener("pointerleave", () => chart.setExternalHighlight(
+      target.matches(":focus-visible") ? row.highlight[1] : null,
+    ));
+    target.addEventListener("focus", () => chart.setExternalHighlight(row.highlight[1]));
+    target.addEventListener("blur", () => chart.setExternalHighlight(null));
   });
   return element;
 }
@@ -132,7 +148,10 @@ function clearCards(prefix) {
     if (key.startsWith(`${prefix}:`)) metricNodes.delete(key);
   }
   for (const key of [...charts.keys()]) {
-    if (key.startsWith(`${prefix}:`)) charts.delete(key);
+    if (key.startsWith(`${prefix}:`)) {
+      charts.get(key).destroy();
+      charts.delete(key);
+    }
   }
   if (prefix === "gpu") fanControls.clear();
 }
@@ -188,8 +207,7 @@ function profileFromState(state) {
   return {
     minimum_percent: state.minimum_percent ?? 30,
     maximum_percent: state.maximum_percent ?? 100,
-    idle_temperature_celsius: state.idle_temperature_celsius ?? 60,
-    idle_duration_seconds: state.idle_duration_seconds ?? 20,
+    cooldown_seconds: state.cooldown_seconds ?? state.idle_duration_seconds ?? 20,
     step_percent: state.step_percent ?? 5,
     curve_points: clonePoints(state.curve_points),
     revision: state.revision ?? 0,
@@ -199,14 +217,15 @@ function profileFromState(state) {
 function drawFanCurve(svg, profile, options = {}) {
   const namespace = "http://www.w3.org/2000/svg";
   svg.replaceChildren();
-  svg.setAttribute("viewBox", "0 0 640 160");
+  const viewWidth = Math.max(280, svg.parentElement?.clientWidth || 640);
+  svg.setAttribute("viewBox", `0 0 ${viewWidth} 160`);
   svg.classList.add("timeseries-svg");
 
   const left = 38;
   const right = 12;
   const top = 12;
   const bottom = 26;
-  const width = 640 - left - right;
+  const width = viewWidth - left - right;
   const height = 160 - top - bottom;
   const minFan = Number(profile.minimum_percent) || 0;
   const maxFan = Number(profile.maximum_percent) || 100;
@@ -246,7 +265,7 @@ function drawFanCurve(svg, profile, options = {}) {
 
   if (!points.length) {
     const empty = document.createElementNS(namespace, "text");
-    empty.setAttribute("x", 320);
+    empty.setAttribute("x", viewWidth / 2);
     empty.setAttribute("y", 86);
     empty.setAttribute("text-anchor", "middle");
     empty.classList.add("empty-chart");
@@ -262,7 +281,8 @@ function drawFanCurve(svg, profile, options = {}) {
     return top + height - normalized * height;
   };
 
-  let pathData = `M ${xAt(0).toFixed(2)} ${yAt(minFan).toFixed(2)}`;
+  axisLabel(xAt(points[0].temperature_celsius / 2), top + height / 2, "Auto", "middle");
+  let pathData = `M ${xAt(points[0].temperature_celsius).toFixed(2)} ${yAt(minFan).toFixed(2)}`;
   let current = minFan;
   points.forEach((point) => {
     pathData += ` L ${xAt(point.temperature_celsius).toFixed(2)} ${yAt(current).toFixed(2)}`;
@@ -271,9 +291,24 @@ function drawFanCurve(svg, profile, options = {}) {
   });
   pathData += ` L ${xAt(maxTemp).toFixed(2)} ${yAt(current).toFixed(2)}`;
 
+  const descending = document.createElementNS(namespace, "path");
+  let downData = "";
+  let previous = minFan;
+  points.forEach((point) => {
+    const x = xAt(Math.max(0, point.temperature_celsius - 3));
+    downData += ` M ${x} ${yAt(previous)} L ${x} ${yAt(point.fan_percent)}`;
+    previous = point.fan_percent;
+  });
+  descending.setAttribute("d", downData);
+  descending.setAttribute("stroke", COLORS.slate);
+  descending.dataset.series = "cool";
+  descending.setAttribute("stroke-dasharray", "4 4");
+  descending.classList.add("chart-line");
+  svg.appendChild(descending);
   const path = document.createElementNS(namespace, "path");
   path.setAttribute("d", pathData);
-  path.setAttribute("stroke", COLORS.cyan);
+  path.setAttribute("stroke", COLORS.blue);
+  path.dataset.series = "rise";
   path.classList.add("chart-line");
   svg.appendChild(path);
 
@@ -282,21 +317,35 @@ function drawFanCurve(svg, profile, options = {}) {
     circle.setAttribute("cx", xAt(point.temperature_celsius));
     circle.setAttribute("cy", yAt(point.fan_percent));
     circle.setAttribute("r", "3.2");
-    circle.setAttribute("fill", COLORS.cyan);
-    circle.setAttribute("stroke", "#0d1621");
+    circle.setAttribute("fill", COLORS.blue);
+    circle.dataset.series = "rise";
+    circle.setAttribute("stroke", "var(--card-surface)");
     circle.setAttribute("stroke-width", "1.5");
     svg.appendChild(circle);
   });
+  const block = svg.closest(".fan-curve-chart");
+  if (block) window.highlightChartSeries(block, block.dataset.activeSeries || null);
 }
 
 function createCurveChartBlock(title) {
   const block = textElement("div", "chart-block fan-curve-chart", "");
   block.appendChild(textElement("div", "chart-title", title));
   const legend = textElement("div", "chart-legend", "");
-  const item = textElement("span", "legend-item", "");
-  const swatch = document.createElement("i");
-  swatch.style.background = COLORS.cyan;
-  item.append(swatch, document.createTextNode("Fan curve"));
+  for (const [key, label, color] of [["rise", "Rise", COLORS.blue], ["cool", "Cool down", COLORS.slate]]) {
+    const item = textElement("button", "legend-item", "");
+    item.type = "button";
+    item.dataset.series = key;
+    const swatch = textElement("i", key === "cool" ? "dashed-swatch" : "", "");
+    swatch.style.background = color;
+    item.append(swatch, document.createTextNode(label));
+    item.addEventListener("click", () => {
+      item.blur();
+      block.dataset.activeSeries = block.dataset.activeSeries === key ? "" : key;
+      window.highlightChartSeries(block, block.dataset.activeSeries || null);
+    });
+    legend.appendChild(item);
+  }
+  const item = textElement("span", "curve-step-count", "");
   legend.appendChild(item);
   const chart = textElement("div", "chart", "");
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -304,18 +353,20 @@ function createCurveChartBlock(title) {
   svg.setAttribute("aria-label", title);
   chart.appendChild(svg);
   block.append(legend, chart);
+  const highlight = (key) => {
+    block.dataset.activeSeries = key || "";
+    window.highlightChartSeries(block, key);
+  };
+  block.addEventListener("pointerover", (event) => highlight(event.target.closest("[data-series]")?.dataset.series || null));
+  block.addEventListener("pointerleave", () => highlight(null));
+  block.addEventListener("focusin", (event) => highlight(event.target.dataset.series || null));
+  block.addEventListener("focusout", () => highlight(null));
   return { block, svg, legendItem: item };
 }
 
 function updateCurveLegend(legendItem, profile) {
-  const points = sortedPoints(profile.curve_points);
-  const label = points.length
-    ? `Fan curve · ${points.length} point${points.length === 1 ? "" : "s"}`
-    : "Fan curve · automatic";
-  legendItem.replaceChildren();
-  const swatch = document.createElement("i");
-  swatch.style.background = COLORS.cyan;
-  legendItem.append(swatch, document.createTextNode(label));
+  const count = (profile.curve_points || []).length;
+  legendItem.textContent = count ? `${count} step${count === 1 ? "" : "s"}` : "Automatic";
 }
 
 function createFanControl(gpu) {
@@ -363,7 +414,7 @@ function updateFanControl(gpu, overrideMessage = null) {
   drawFanCurve(nodes.preview, nodes.profile);
   updateCurveLegend(nodes.legendItem, nodes.profile);
 
-  const mode = state.mode === "curve" ? "Curve" : "Automatic";
+  const mode = state.applied_percent != null ? "Step control" : "Automatic";
   const applied = state.applied_percent == null ? "" : ` · ${state.applied_percent}%`;
   nodes.modeBadge.textContent = `${mode}${applied}`;
   nodes.editButton.disabled = nodes.pending || !supported;
@@ -390,18 +441,6 @@ function updateFanControl(gpu, overrideMessage = null) {
   if (overrideMessage) {
     nodes.message.textContent = overrideMessage;
     nodes.message.className = "fan-control-message error";
-  } else if (state.idle_locked) {
-    nodes.message.textContent = (
-      `Idle below ${state.idle_temperature_celsius ?? 60}°C — `
-      + "NVIDIA automatic mode is enforced."
-    );
-    nodes.message.className = "fan-control-message";
-  } else if (state.idle_pending) {
-    nodes.message.textContent = (
-      `Idle below ${state.idle_temperature_celsius ?? 60}°C — automatic mode in `
-      + `${Math.ceil(state.idle_remaining_seconds ?? 0)}s if it remains idle.`
-    );
-    nodes.message.className = "fan-control-message";
   } else if (!supported) {
     nodes.message.textContent = state.error || "Fan control is unavailable.";
     nodes.message.className = "fan-control-message error";
@@ -412,7 +451,9 @@ function updateFanControl(gpu, overrideMessage = null) {
     nodes.message.textContent = "Empty curve uses NVIDIA automatic fan control.";
     nodes.message.className = "fan-control-message";
   } else {
-    nodes.message.textContent = "";
+    nodes.message.textContent = state.cooldown_remaining_seconds != null
+      ? `Cooling down · next lower step in ${Math.ceil(state.cooldown_remaining_seconds)}s`
+      : `Rise at each threshold · drop after ${state.cooldown_seconds ?? 20}s at ${state.hysteresis_celsius ?? 3}°C below it`;
     nodes.message.className = "fan-control-message";
   }
 
@@ -469,14 +510,14 @@ function openFanEditor(gpuUuid) {
   closeButton.className = "modal-close";
   closeButton.setAttribute("aria-label", "Close without saving");
   closeButton.textContent = "×";
+  heading.appendChild(textElement("p", "modal-subtitle", "Rise immediately at a threshold. Stay 3°C below it for the hold time to drop one step. Below the first step, return to automatic."));
   header.append(heading, closeButton);
 
   const limits = textElement("div", "fan-limits", "");
   const fields = [
     ["minimum_percent", "Min fan %"],
     ["maximum_percent", "Max fan %"],
-    ["idle_temperature_celsius", "Idle below °C"],
-    ["idle_duration_seconds", "Idle duration s"],
+    ["cooldown_seconds", "Cool-down hold (seconds)"],
   ].map(([key, labelText]) => {
     const label = textElement("label", "", labelText);
     const input = document.createElement("input");
@@ -666,8 +707,7 @@ async function submitFanProfile(gpuUuid, payload) {
       body: JSON.stringify({
         minimum_percent: Number(payload.minimum_percent),
         maximum_percent: Number(payload.maximum_percent),
-        idle_temperature_celsius: Number(payload.idle_temperature_celsius),
-        idle_duration_seconds: Number(payload.idle_duration_seconds),
+        cooldown_seconds: Number(payload.cooldown_seconds),
         curve_points: payload.curve_points,
         expected_revision: payload.expected_revision,
       }),
@@ -826,8 +866,8 @@ function setupSystemCards() {
       id: "history",
       title: "Usage and temperature",
       series: [
-        series("cpu_usage_percent", "Usage", COLORS.cyan),
-        series("cpu_temperature_celsius", "Temperature", COLORS.rose, formatTemperature),
+        series("cpu_usage_percent", "Usage", COLORS.blue),
+        series("cpu_temperature_celsius", "Temperature", COLORS.coral, formatTemperature),
       ],
     }]),
     createMetricCard("system-memory", "Memory", "Physical memory pressure", [
@@ -837,7 +877,7 @@ function setupSystemCards() {
     ], [{
       id: "history",
       title: "Usage",
-      series: [series("memory_usage_percent", "Memory", COLORS.violet)],
+      series: [series("memory_usage_percent", "Memory", COLORS.teal)],
     }]),
     createMetricCard("system-swap", "Swap", "Overflow memory activity", [
       { id: "usage", primary: true },
@@ -846,7 +886,7 @@ function setupSystemCards() {
     ], [{
       id: "history",
       title: "Usage",
-      series: [series("swap_usage_percent", "Swap", COLORS.amber)],
+      series: [series("swap_usage_percent", "Swap", COLORS.violet)],
     }]),
   );
 }
@@ -886,11 +926,11 @@ function renderGpus(gpus) {
         `GPU ${gpu.index}`,
         gpu.name,
         [
-          { id: "utilization", primary: true },
-          { id: "temperature", label: "Temperature" },
-          { id: "memory", label: "Memory" },
+          { id: "utilization", primary: true, highlight: ["load", "utilization_percent"] },
+          { id: "temperature", label: "Temperature", highlight: ["thermal", "temperature_celsius"] },
+          { id: "memory", label: "Memory", highlight: ["load", "memory_used_bytes"] },
           { id: "fan", label: "Fan" },
-          { id: "power", label: "Power" },
+          { id: "power", label: "Power", highlight: ["thermal", "power_watts"] },
           { id: "workloads", label: "Workloads" },
         ],
         [
@@ -898,8 +938,8 @@ function renderGpus(gpus) {
             id: "load",
             title: "Compute and memory load",
             series: [
-              series("utilization_percent", "GPU", COLORS.cyan),
-              series("memory_used_bytes", "VRAM", COLORS.violet, formatPercent,
+              series("utilization_percent", "GPU", COLORS.blue),
+              series("memory_used_bytes", "VRAM", COLORS.teal, formatPercent,
                 (point) => point.memory_total_bytes
                   ? point.memory_used_bytes / point.memory_total_bytes * 100 : null),
             ],
@@ -908,14 +948,15 @@ function renderGpus(gpus) {
             id: "thermal",
             title: "Thermals and power",
             series: [
-              series("temperature_celsius", "Temperature", COLORS.rose, formatTemperature),
-              series("power_watts", "Power", COLORS.amber, formatPercent,
+              series("temperature_celsius", "Temperature", COLORS.coral, formatTemperature),
+              series("power_watts", "Power", COLORS.violet, formatPercent,
                 (point) => point.power_limit_watts
                   ? point.power_watts / point.power_limit_watts * 100 : null),
             ],
           },
         ],
       );
+      card.classList.add("gpu-card");
       card.appendChild(createFanControl(gpu));
       return card;
     });
@@ -934,9 +975,15 @@ function renderGpus(gpus) {
     setMetric(key, "fan", formatPercent(gpu.fan_percent));
     setMetric(key, "power", gpu.power_watts == null ? "N/A"
       : `${gpu.power_watts.toFixed(1)} / ${gpu.power_limit_watts?.toFixed(1) ?? "N/A"} W`);
-    setMetric(key, "workloads",
-      `${gpu.process_count} process${gpu.process_count === 1 ? "" : "es"} · `
-      + ((gpu.users || []).join(", ") || "No users"));
+    const workloads = metricNodes.get(`${key}:workloads`);
+    workloads.tabIndex = 0;
+    workloads.setAttribute("aria-label", "GPU workloads and users; scroll to see all users");
+    const users = gpu.users || [];
+    workloads.replaceChildren(
+      textElement("span", "workload-count", `${gpu.process_count ?? 0} processes`),
+      ...users.map((user) => textElement("span", "user-chip", user)),
+      ...(users.length ? [] : [textElement("span", "workload-idle", "Available")]),
+    );
     updateFanControl(gpu);
   });
 }
@@ -1031,7 +1078,7 @@ function renderDisks(disks) {
       [{
         id: "history",
         title: "Space used",
-        series: [series("usage_percent", "Usage", COLORS.emerald)],
+        series: [series("usage_percent", "Usage", COLORS.teal)],
       }],
     ));
     $("#disks").replaceChildren(...cards);
@@ -1080,7 +1127,12 @@ function replaceRows(selector, rows) {
   }
   rows.forEach((values) => {
     const row = document.createElement("tr");
-    values.forEach((value) => row.appendChild(textElement("td", "", String(value))));
+    values.forEach((value) => {
+      const cell = textElement("td", "", "");
+      if (value instanceof Node) cell.appendChild(value);
+      else cell.textContent = String(value);
+      row.appendChild(cell);
+    });
     body.appendChild(row);
   });
 }
@@ -1116,6 +1168,82 @@ async function request(path, options = {}) {
   return data;
 }
 
+function openProcessCommand(process) {
+  const dialog = $("#command-dialog");
+  $("#command-context").textContent = `GPU ${process.gpu_index} · ${process.username} · PID ${process.pid}`;
+  $("#command-full").textContent = process.command || process.executable || "N/A";
+  $("#command-copy-status").textContent = "";
+  dialog.showModal();
+}
+
+function processCommand(process) {
+  const button = textElement("button", "command-open", "");
+  button.type = "button";
+  button.append(textElement("span", "command-preview", ""), textElement("span", "command-open-label", "View ↗"));
+  button.addEventListener("click", () => openProcessCommand(button.process));
+  updateProcessCommand(button, process);
+  return button;
+}
+
+function updateProcessCommand(button, process) {
+  button.process = process;
+  button.setAttribute("aria-label", `View command for PID ${process.pid}`);
+  button.setAttribute("aria-haspopup", "dialog");
+  button.querySelector(".command-preview").textContent = process.command || process.executable || "N/A";
+}
+
+function renderGpuProcesses(processes) {
+  if (!processes.length) {
+    replaceRows("#gpu-processes", []);
+    return;
+  }
+  const body = $("#gpu-processes tbody");
+  const existing = new Map([...body.rows].map((row) => [row.dataset.key, row]));
+  const active = new Set();
+  processes.forEach((process, index) => {
+    const key = `${process.gpu_index}:${process.pid}:${process.create_time ?? ""}`;
+    let row = existing.get(key);
+    if (!row) {
+      row = document.createElement("tr");
+      row.dataset.key = key;
+      for (let i = 0; i < 8; i++) row.appendChild(document.createElement("td"));
+      row.cells[7].appendChild(processCommand(process));
+    }
+    const values = [process.gpu_index, process.username, process.pid,
+      formatBytes(process.gpu_memory_bytes), formatPercent(process.cpu_percent),
+      formatBytes(process.memory_rss_bytes), formatDuration(process.runtime_seconds)];
+    values.forEach((value, i) => {
+      if (row.cells[i].textContent !== String(value)) row.cells[i].textContent = String(value);
+    });
+    updateProcessCommand(row.cells[7].firstElementChild, process);
+    // Leave unchanged rows in place so refreshes preserve focus and selection.
+    if (body.children[index] !== row) body.insertBefore(row, body.children[index] || null);
+    active.add(row);
+  });
+  [...body.children].forEach((row) => { if (!active.has(row)) row.remove(); });
+}
+
+$("#command-copy").addEventListener("click", async () => {
+  const command = $("#command-full");
+  try {
+    await navigator.clipboard.writeText(command.textContent);
+    $("#command-copy-status").textContent = "Copied to clipboard";
+  } catch {
+    const range = document.createRange();
+    range.selectNodeContents(command);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    $("#command-copy-status").textContent = "Command selected — press Ctrl+C or ⌘C to copy";
+  }
+});
+$("#command-dialog").addEventListener("click", (event) => {
+  const dialog = event.currentTarget;
+  const bounds = dialog.getBoundingClientRect();
+  if (event.target === dialog && (event.clientX < bounds.left || event.clientX > bounds.right
+      || event.clientY < bounds.top || event.clientY > bounds.bottom)) dialog.close();
+});
+
 async function refreshLive() {
   const [summary, gpus, processes, users, disks, alerts] = await Promise.all([
     request("/api/summary"), request("/api/gpus"), request("/api/gpu-processes"),
@@ -1124,11 +1252,7 @@ async function refreshLive() {
   renderSystem(summary);
   renderGpus(gpus);
   renderDisks(disks);
-  replaceRows("#gpu-processes", processes.map((process) => [
-    process.gpu_index, process.username, process.pid, formatBytes(process.gpu_memory_bytes),
-    formatPercent(process.cpu_percent), formatBytes(process.memory_rss_bytes),
-    formatDuration(process.runtime_seconds), process.command || process.executable,
-  ]));
+  renderGpuProcesses(processes);
   renderUsers(users);
   replaceRows("#alerts", alerts.map((alert) => [
     alert.gpu_index, new Date(alert.triggered_at * 1000).toLocaleString(), alert.status,

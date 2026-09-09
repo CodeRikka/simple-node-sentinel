@@ -207,60 +207,123 @@ class FanControlServiceTests(unittest.TestCase):
         finally:
             service.database.close()
 
-    def test_idle_low_temperature_forces_auto_and_unlocks_on_process(self) -> None:
+    def test_cooling_steps_down_with_active_processes_and_then_returns_to_auto(self) -> None:
         service = self.make_service()
-        try:
-            service.database.ensure_fan_profile("GPU-1")
-            gpu = {
-                "uuid": "GPU-1",
-                "process_count": 0,
-                "temperature_celsius": 55,
-            }
-            service._refresh_fan_controls([gpu], monotonic_now=100)
-            self.assertTrue(gpu["fan_control"]["idle_pending"])
-            self.assertFalse(gpu["fan_control"]["idle_locked"])
-            service._refresh_fan_controls([gpu], monotonic_now=120)
-            self.assertTrue(gpu["fan_control"]["idle_locked"])
-            self.assertEqual(gpu["fan_control"]["mode"], "curve")
-            service.fan_controller.set_auto.assert_called_with("GPU-1")
+        self.addCleanup(service.database.close)
+        profile = service.database.ensure_fan_profile("GPU-1")
+        service.set_fan_profile("GPU-1", FanProfileRequest(
+            minimum_percent=30, maximum_percent=100, cooldown_seconds=20,
+            curve_points=[FanCurvePointModel(temperature_celsius=70, fan_percent=70),
+                          FanCurvePointModel(temperature_celsius=80, fan_percent=80)],
+            expected_revision=profile["revision"],
+        ))
+        gpu = {"uuid": "GPU-1", "process_count": 2, "temperature_celsius": 81}
+        # Heating skips directly to the necessary step.
+        for now, temperature, expected in [
+            (100, 81, 80), (101, 79, 80), (150, 78, 80),
+            (151, 77, 80), (170, 77, 80), (171, 77, 70),
+            (172, 67, 70), (192, 67, None), (193, 80, 80),
+        ]:
+            gpu["temperature_celsius"] = temperature
+            service._refresh_fan_controls([gpu], monotonic_now=now)
+            self.assertEqual(gpu["fan_control"]["applied_percent"], expected,
+                             (now, temperature))
+        service.fan_controller.set_auto.assert_called_with("GPU-1")
+        service.fan_controller.set_manual.assert_called_with("GPU-1", 80)
 
-            gpu["process_count"] = 1
-            gpu["temperature_celsius"] = 81
-            service._refresh_fan_controls([gpu], monotonic_now=121)
-            self.assertFalse(gpu["fan_control"]["idle_locked"])
-            self.assertEqual(gpu["fan_control"]["applied_percent"], 80)
-            service.fan_controller.set_manual.assert_called_with("GPU-1", 80)
-        finally:
-            service.database.close()
-
-    def test_curve_ratchets_up_and_does_not_lower(self) -> None:
+    def test_cooldown_resets_on_rebound_or_missing_temperature(self) -> None:
         service = self.make_service()
-        try:
-            profile = service.database.ensure_fan_profile("GPU-1")
-            service.database.update_fan_profile(
-                "GPU-1",
-                minimum_percent=30,
-                maximum_percent=100,
-                idle_temperature_celsius=60,
-                idle_duration_seconds=20,
-                curve_points=[
-                    {"temperature_celsius": 70, "fan_percent": 70},
-                    {"temperature_celsius": 80, "fan_percent": 80},
-                ],
-                expected_revision=profile["revision"],
-            )
-            gpu = {
-                "uuid": "GPU-1",
-                "process_count": 1,
-                "temperature_celsius": 81,
-            }
-            service._refresh_fan_controls([gpu], monotonic_now=100)
-            self.assertEqual(gpu["fan_control"]["applied_percent"], 80)
-            gpu["temperature_celsius"] = 71
-            service._refresh_fan_controls([gpu], monotonic_now=101)
-            self.assertEqual(gpu["fan_control"]["applied_percent"], 80)
-        finally:
-            service.database.close()
+        self.addCleanup(service.database.close)
+        gpu = {"uuid": "GPU-1", "process_count": 1}
+        for now, temperature, expected in [
+            (0, 80, 80), (1, 77, 80), (15, 78, 80),
+            (20, 77, 80), (30, None, 80), (40, 77, 80),
+            (59, 77, 80), (60, 77, None),
+        ]:
+            gpu["temperature_celsius"] = temperature
+            service._refresh_fan_controls([gpu], monotonic_now=now)
+            self.assertEqual(gpu["fan_control"]["applied_percent"], expected,
+                             (now, temperature))
+
+    def test_automatic_and_unchanged_targets_are_not_rewritten(self) -> None:
+        service = self.make_service()
+        self.addCleanup(service.database.close)
+        gpu = {"uuid": "GPU-1", "process_count": 0, "temperature_celsius": 50}
+        for now in range(5):
+            service._refresh_fan_controls([gpu], monotonic_now=now)
+        service.fan_controller.set_auto.assert_called_once_with("GPU-1")
+        gpu["temperature_celsius"] = 80
+        for now in range(5, 10):
+            service._refresh_fan_controls([gpu], monotonic_now=now)
+        service.fan_controller.set_manual.assert_called_once_with("GPU-1", 80)
+
+    def test_failed_write_retries_even_when_target_matches_last_success(self) -> None:
+        service = self.make_service()
+        self.addCleanup(service.database.close)
+        gpu = {"uuid": "GPU-1", "temperature_celsius": 80}
+        service._refresh_fan_controls([gpu], monotonic_now=0)
+        gpu["temperature_celsius"] = 77
+        service._refresh_fan_controls([gpu], monotonic_now=1)
+        service.fan_controller.set_auto.side_effect = FanControlError("temporary error")
+        service._refresh_fan_controls([gpu], monotonic_now=21)
+        gpu["temperature_celsius"] = 80
+        service._refresh_fan_controls([gpu], monotonic_now=22)
+        self.assertEqual(service.fan_controller.set_manual.call_count, 2)
+        self.assertIsNone(gpu["fan_control"]["error"])
+
+    def test_legacy_idle_setting_is_accepted_but_not_used_as_an_extra_gate(self) -> None:
+        service = self.make_service()
+        self.addCleanup(service.database.close)
+        service.database.ensure_fan_profile("GPU-1")
+        profile = service.set_fan_profile("GPU-1", FanProfileRequest(
+            minimum_percent=30, maximum_percent=100, idle_temperature_celsius=100,
+            idle_duration_seconds=10,
+            curve_points=[FanCurvePointModel(temperature_celsius=80, fan_percent=80)],
+            expected_revision=0,
+        ))
+        self.assertEqual(profile["cooldown_seconds"], 10)
+        gpu = {"uuid": "GPU-1", "process_count": 0, "temperature_celsius": 85}
+        service._refresh_fan_controls([gpu], monotonic_now=0)
+        service._refresh_fan_controls([gpu], monotonic_now=100)
+        self.assertEqual(gpu["fan_control"]["applied_percent"], 80)
+
+    def test_equal_speed_points_do_not_create_extra_cooling_levels(self) -> None:
+        service = self.make_service()
+        self.addCleanup(service.database.close)
+        service.database.ensure_fan_profile("GPU-1")
+        service.set_fan_profile("GPU-1", FanProfileRequest(
+            minimum_percent=30, maximum_percent=100, cooldown_seconds=20,
+            curve_points=[FanCurvePointModel(temperature_celsius=70, fan_percent=70),
+                          FanCurvePointModel(temperature_celsius=75, fan_percent=70),
+                          FanCurvePointModel(temperature_celsius=80, fan_percent=80)],
+            expected_revision=0,
+        ))
+        gpu = {"uuid": "GPU-1", "process_count": 1}
+        for now, temperature, expected in [
+            (0, 85, 80), (1, 60, 80), (21, 60, 70),
+            (22, 60, 70), (42, 60, None),
+        ]:
+            gpu["temperature_celsius"] = temperature
+            service._refresh_fan_controls([gpu], monotonic_now=now)
+            self.assertEqual(gpu["fan_control"]["applied_percent"], expected)
+
+    def test_editing_curve_resets_cooldown_and_restores_auto_below_new_first_step(self) -> None:
+        service = self.make_service()
+        self.addCleanup(service.database.close)
+        gpu = {"uuid": "GPU-1", "temperature_celsius": 80}
+        service._refresh_fan_controls([gpu], monotonic_now=0)
+        gpu["temperature_celsius"] = 77
+        service._refresh_fan_controls([gpu], monotonic_now=1)
+        service.set_fan_profile("GPU-1", FanProfileRequest(
+            minimum_percent=30, maximum_percent=100, cooldown_seconds=30,
+            curve_points=[FanCurvePointModel(temperature_celsius=85, fan_percent=85)],
+            expected_revision=0,
+        ))
+        service._refresh_fan_controls([gpu], monotonic_now=30)
+        self.assertIsNone(gpu["fan_control"]["applied_percent"])
+        self.assertIsNone(gpu["fan_control"]["cooldown_remaining_seconds"])
+        service.fan_controller.set_auto.assert_called_with("GPU-1")
+        self.assertEqual(service.database.get_fan_profile("GPU-1")["idle_duration_seconds"], 30)
 
     def test_empty_curve_uses_automatic_mode(self) -> None:
         service = self.make_service()
@@ -290,7 +353,7 @@ class FanControlServiceTests(unittest.TestCase):
         finally:
             service.database.close()
 
-    def test_unknown_temperature_does_not_start_idle_lock(self) -> None:
+    def test_unknown_temperature_does_not_start_cooldown(self) -> None:
         service = self.make_service()
         try:
             gpu = {
@@ -299,7 +362,7 @@ class FanControlServiceTests(unittest.TestCase):
                 "temperature_celsius": None,
             }
             service._refresh_fan_controls([gpu])
-            self.assertFalse(gpu["fan_control"]["idle_locked"])
+            self.assertIsNone(gpu["fan_control"]["cooldown_remaining_seconds"])
         finally:
             service.database.close()
 

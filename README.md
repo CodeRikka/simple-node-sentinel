@@ -99,11 +99,21 @@ fan_control:
 ```
 
 Each GPU gets its own persisted profile the first time it is observed: min/max
-fan percents, idle temperature/duration, and a default curve point of
-`80°C → 80%`. While the curve has points, the service applies the highest
-triggered fan target and only ratchets upward until the GPU is idle below the
-idle temperature for the configured duration, then restores NVIDIA automatic
-mode. Deleting every curve point leaves the GPU in automatic mode.
+fan percents, a cool-down hold (20 seconds by default), and a default curve
+point of `80°C → 80%`. Temperature reaching a threshold immediately raises the
+fan to that step, skipping steps when necessary. To drop one step, temperature
+must stay at least 3°C below the current step's threshold for the hold time.
+A rebound or missing temperature reading resets the timer. The lowest step
+returns to NVIDIA automatic control; running processes do not block cooling
+down. For example, `70°C → 70%, 80°C → 80%` rises to 80% at 80°C and drops to
+70% after 20 seconds at or below 77°C. Another hold at or below 67°C returns
+to automatic. Deleting every point also selects automatic mode.
+
+The separate idle-temperature gate (previously 60°C) is retired. Existing
+curves and limits are preserved; the stored idle duration becomes the
+cool-down hold. Older API clients may still send `idle_duration_seconds`;
+`cooldown_seconds` takes precedence. `idle_temperature_celsius` is accepted
+for compatibility but no longer controls fan behavior.
 
 Fan and user settings have no separate login. Everyone who can reach the
 dashboard can change them. Keep the service bound to localhost and grant SSH
@@ -143,6 +153,42 @@ sudo journalctl -u simple-node-sentinel.service -f
 Re-running the installer updates `/opt` and the systemd unit, but does not
 overwrite an existing `config.yaml`. Empty fields can still be filled again
 through the interactive prompts.
+
+### Updating a running installation
+
+The service runs the copy in `/opt/simple-node-sentinel`, not your development
+checkout. To deploy local changes, run the installer from that checkout;
+uncommitted files are included, so a GitHub push or pull is not required.
+From an account with sudo access, replace `/absolute/path/to/checkout` below
+with the checkout containing the changes:
+
+```bash
+sudo -v
+sudo systemctl stop simple-node-sentinel.service && \
+  sudo bash /absolute/path/to/checkout/scripts/install.sh </dev/null && \
+  sudo systemctl start simple-node-sentinel.service
+
+sudo systemctl status simple-node-sentinel.service --no-pager -l
+curl --fail --silent --show-error http://127.0.0.1:8080/health
+```
+
+Stopping first prevents serving a mixture of old and new files while copying.
+The installer keeps the existing config, SMTP password, database, user settings
+and fan profiles. Redirecting stdin from `/dev/null` skips configuration
+prompts. Installation does not start or restart the service by itself;
+the chained start above runs only after installation succeeds. If installation
+fails, inspect the error, fix it and rerun the update sequence.
+
+Allow a few seconds after starting for the health endpoint to become available.
+For startup errors, inspect:
+
+```bash
+sudo journalctl -u simple-node-sentinel.service -n 80 --no-pager
+```
+
+Then hard-refresh the dashboard (`Ctrl+Shift+R`, or `Cmd+Shift+R` on macOS)
+to load the updated JavaScript and CSS. This briefly interrupts monitoring
+and the dashboard; it does not stop GPU workload processes.
 
 ## Uninstall
 
@@ -202,7 +248,20 @@ Open `http://127.0.0.1:18080`.
 The dashboard refreshes current values every two seconds. CPU, memory, swap,
 GPU and disk cards include historical curves with 15-minute, 1-hour, 6-hour,
 24-hour and 3-day ranges. Each GPU card edits its own fan curve with a live
-preview. The animated fan icon is green at 60°C and below, transitions toward
+preview. Workload users occupy a scrollable strip so multiple users do not
+resize the metric grid. GPU cards stay in two columns above 760px; charts
+inside narrower cards stack vertically. Hover a history line, its legend, or
+a corresponding GPU metric to fade the other series. Legend buttons also
+support keyboard focus and click-to-pin highlighting; Escape clears it.
+Fan previews use one step line with separate dashed cooling thresholds.
+
+GPU process rows show a compact command preview. **View** opens the complete
+command in a separate reading dialog with a copy button, without expanding
+the table row. The dialog stays stable while metrics refresh; sensitive
+arguments remain redacted. The header links to this GitHub
+repository. The theme switch selects light or dark mode; light is the default,
+and the browser remembers your choice independently of the system theme.
+The animated fan icon is green at 60°C and below, transitions toward
 red between 60°C and 90°C, and stays red at 90°C and above. Charts and icons
 are served locally and do not require internet access.
 
@@ -234,8 +293,7 @@ curl -X PUT http://127.0.0.1:8080/api/gpus/GPU-UUID/fan-profile \
   -d '{
     "minimum_percent": 30,
     "maximum_percent": 100,
-    "idle_temperature_celsius": 60,
-    "idle_duration_seconds": 20,
+    "cooldown_seconds": 20,
     "curve_points": [{"temperature_celsius": 80, "fan_percent": 80}],
     "expected_revision": 0
   }'
@@ -266,7 +324,7 @@ curl -s http://127.0.0.1:8080/api/gpus
 
 ## Tests
 
-Tests use mocks for NVML fan writes, concurrency, restart/idle policy, SMTP and
+Tests use mocks for NVML fan writes, concurrency, restart/cool-down policy, SMTP and
 process edge cases. SQLite tests use only an automatically removed temporary
 directory and never change real fan settings:
 
@@ -275,5 +333,5 @@ conda run -n test python -m unittest discover -s tests -v
 ```
 
 Production checks that require an administrator and real hardware should cover
-cross-user `/proc` visibility, sensor labels, NVML values and fan writes, idle
+cross-user `/proc` visibility, sensor labels, NVML values and fan writes, step-down
 automatic restoration, SMTP delivery and the final systemd sandbox.

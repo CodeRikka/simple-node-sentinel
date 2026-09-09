@@ -1,9 +1,10 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Simple Node Sentinel</title>
+    <script src="/static/theme.js"></script>
     <link rel="stylesheet" href="/static/style.css">
   </head>
   <body>
@@ -26,6 +27,15 @@
             <option value="259200">3 days</option>
           </select>
         </label>
+        <a class="small-button github-link" href="https://github.com/CodeRikka/simple-node-sentinel" target="_blank" rel="noopener noreferrer" aria-label="View Simple Node Sentinel on GitHub (opens in a new tab)">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 .8a11.2 11.2 0 0 0-3.54 21.83c.56.1.77-.24.77-.54v-2.1c-3.13.68-3.8-1.33-3.8-1.33-.5-1.3-1.25-1.65-1.25-1.65-1.02-.7.08-.69.08-.69 1.13.08 1.73 1.16 1.73 1.16 1 .1.57 2.01 3.27 1.43.1-.73.4-1.23.72-1.51-2.5-.28-5.12-1.25-5.12-5.57 0-1.23.44-2.24 1.16-3.03-.12-.29-.5-1.43.11-2.98 0 0 .95-.3 3.08 1.16a10.7 10.7 0 0 1 5.6 0c2.13-1.46 3.08-1.16 3.08-1.16.61 1.55.23 2.69.11 2.98.72.79 1.16 1.8 1.16 3.03 0 4.33-2.63 5.28-5.14 5.56.4.35.76 1.03.76 2.08v2.62c0 .3.2.65.78.54A11.2 11.2 0 0 0 12 .8Z"/></svg>
+          GitHub
+        </a>
+        <button id="theme-toggle" class="small-button theme-toggle" type="button" role="switch" aria-label="Dark mode" aria-checked="false" title="Switch to dark mode">
+          <svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg>
+          <svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 13A8.5 8.5 0 0 1 11 3.5 8.5 8.5 0 1 0 20.5 13Z"/></svg>
+          <span class="theme-label">Light</span>
+        </button>
         <div id="connection" class="status">Connecting…</div>
       </div>
     </header>
@@ -115,6 +125,17 @@
       </section>
     </main>
     <div id="modal-root"></div>
+    <dialog id="command-dialog" class="modal-dialog command-dialog" aria-labelledby="command-title" aria-describedby="command-context">
+      <div class="modal-header">
+        <div><h3 id="command-title">Process command</h3><p id="command-context" class="modal-subtitle"></p></div>
+        <form method="dialog"><button class="modal-close" aria-label="Close command" autofocus>×</button></form>
+      </div>
+      <pre id="command-full" class="command-full" tabindex="0"></pre>
+      <div class="command-actions">
+        <span id="command-copy-status" role="status"></span>
+        <button id="command-copy" class="small-button" type="button">Copy command</button>
+      </div>
+    </dialog>
     <script src="/static/chart.js"></script>
     <script src="/static/app.js"></script>
   </body>

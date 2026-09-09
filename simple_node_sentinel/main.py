@@ -30,6 +30,7 @@ from .user_directory import apply_legacy_user_import, sync_user_settings
 LOGGER = logging.getLogger(__name__)
 WEB_DIRECTORY = Path(__file__).with_name("web")
 USER_SYNC_INTERVAL_SECONDS = 6 * 3600
+FAN_HYSTERESIS_CELSIUS = 3.0
 
 
 class FanCurvePointModel(BaseModel):
@@ -40,8 +41,10 @@ class FanCurvePointModel(BaseModel):
 class FanProfileRequest(BaseModel):
     minimum_percent: int = Field(ge=0, le=100)
     maximum_percent: int = Field(ge=0, le=100)
-    idle_temperature_celsius: float = Field(gt=0, le=120)
-    idle_duration_seconds: float = Field(gt=0)
+    # Legacy fields remain readable for existing clients and databases.
+    idle_temperature_celsius: float = Field(default=60, gt=0, le=120)
+    idle_duration_seconds: float = Field(default=20, gt=0)
+    cooldown_seconds: float | None = Field(default=None, gt=0)
     curve_points: list[FanCurvePointModel] = Field(default_factory=list)
     expected_revision: int
 
@@ -205,16 +208,14 @@ class SentinelService:
             runtime = {
                 "supported": False,
                 "error": "Fan control is disabled by configuration",
-                "idle_locked": False,
-                "idle_since": None,
+                "cooldown_since": None,
                 "applied_percent": None,
             }
         elif not self.fan_controller.initialized:
             runtime = {
                 "supported": False,
                 "error": self.fan_controller.last_error or "Fan control is unavailable",
-                "idle_locked": False,
-                "idle_since": None,
+                "cooldown_since": None,
                 "applied_percent": None,
             }
         else:
@@ -222,8 +223,7 @@ class SentinelService:
             runtime = {
                 "supported": supported,
                 "error": error,
-                "idle_locked": False,
-                "idle_since": None,
+                "cooldown_since": None,
                 "applied_percent": None,
             }
         self._fan_runtime[gpu_uuid] = runtime
@@ -245,7 +245,6 @@ class SentinelService:
         self, gpu_uuid: str, profile: dict[str, Any]
     ) -> dict[str, Any]:
         runtime = self._runtime_for_gpu(gpu_uuid)
-        idle_locked = bool(runtime["idle_locked"])
         points = list(profile.get("curve_points") or [])
         mode = "curve" if points else "auto"
         return {
@@ -254,10 +253,14 @@ class SentinelService:
             "mode": mode,
             "applied_percent": runtime.get("applied_percent"),
             "revision": profile["revision"],
-            "curve_active": mode == "curve" and not idle_locked,
-            "idle_locked": idle_locked,
-            "idle_pending": bool(runtime.get("idle_pending")),
-            "idle_remaining_seconds": runtime.get("idle_remaining_seconds"),
+            "curve_active": mode == "curve" and runtime.get("applied_percent") is not None,
+            "cooldown_seconds": profile["idle_duration_seconds"],
+            "hysteresis_celsius": FAN_HYSTERESIS_CELSIUS,
+            "cooldown_remaining_seconds": runtime.get("cooldown_remaining_seconds"),
+            # Deprecated response fields for older dashboards.
+            "idle_locked": False,
+            "idle_pending": False,
+            "idle_remaining_seconds": None,
             "error": runtime.get("error"),
             "minimum_percent": profile["minimum_percent"],
             "maximum_percent": profile["maximum_percent"],
@@ -282,78 +285,47 @@ class SentinelService:
                 control_succeeded = True
                 temperature = gpu.get("temperature_celsius")
                 temperature = float(temperature) if temperature is not None else None
-                process_count = int(gpu.get("process_count") or 0)
                 points = list(profile.get("curve_points") or [])
-                idle_temperature = float(profile["idle_temperature_celsius"])
-                idle_duration = float(profile["idle_duration_seconds"])
-                was_idle_locked = bool(runtime["idle_locked"])
-
-                idle_condition = (
-                    process_count == 0
-                    and temperature is not None
-                    and temperature < idle_temperature
-                )
-                if idle_condition:
-                    idle_since = runtime.get("idle_since")
-                    if idle_since is None:
-                        idle_since = now
-                    runtime["idle_since"] = idle_since
-                    idle_elapsed = max(0.0, now - float(idle_since))
-                    idle_locked = (
-                        was_idle_locked or idle_elapsed >= idle_duration
-                    )
-                    runtime["idle_pending"] = not idle_locked
-                    runtime["idle_remaining_seconds"] = max(
-                        0.0, idle_duration - idle_elapsed
-                    )
-                else:
-                    runtime["idle_since"] = None
-                    runtime["idle_pending"] = False
-                    runtime["idle_remaining_seconds"] = None
-                    if (
-                        process_count > 0
-                        or (
-                            temperature is not None
-                            and temperature > idle_temperature
-                        )
-                    ):
-                        idle_locked = False
-                    else:
-                        idle_locked = was_idle_locked
-                runtime["idle_locked"] = idle_locked
-
-                if not points or idle_locked:
-                    runtime["applied_percent"] = None
-                    needs_auto = runtime["supported"] and (
-                        not points
-                        or not was_idle_locked
-                        or runtime.get("last_written_percent") is not None
-                        or gpu_uuid not in self._fan_restored
-                        or runtime.get("error") is not None
-                    )
-                    if needs_auto:
-                        try:
-                            self.fan_controller.set_auto(gpu_uuid)
-                            runtime["error"] = None
-                            runtime["last_written_percent"] = None
-                        except FanControlError as exc:
-                            control_succeeded = False
-                            runtime["error"] = str(exc)
-                            LOGGER.error(
-                                "Unable to restore automatic fan control: %s",
-                                exc,
-                            )
-                    if control_succeeded:
-                        self._fan_restored.add(gpu_uuid)
-                    gpu["fan_control"] = self._fan_payload(gpu_uuid, profile)
-                    continue
-
-                desired = self._curve_target(temperature, points)
                 applied = runtime.get("applied_percent")
-                if desired is not None:
-                    applied = max(
-                        int(applied) if applied is not None else 0, desired
+                runtime["cooldown_remaining_seconds"] = None
+                desired = self._curve_target(temperature, points)
+                if not points:
+                    applied = None
+                    runtime["cooldown_since"] = None
+                elif desired is not None and (applied is None or desired > applied):
+                    # Heating can skip levels: never delay cooling a hot GPU.
+                    applied = desired
+                    runtime["cooldown_since"] = None
+                elif applied is not None and temperature is not None:
+                    # Equal-speed points form one level, entered at the first threshold.
+                    level = next(
+                        (i for i, point in enumerate(points)
+                         if point["fan_percent"] == applied),
+                        None,
                     )
+                    if (
+                        level is not None
+                        and temperature <= points[level]["temperature_celsius"]
+                        - FAN_HYSTERESIS_CELSIUS
+                    ):
+                        since = runtime.get("cooldown_since")
+                        since = now if since is None else since
+                        runtime["cooldown_since"] = since
+                        remaining = max(
+                            0.0, profile["idle_duration_seconds"] - (now - since)
+                        )
+                        runtime["cooldown_remaining_seconds"] = remaining
+                        if remaining == 0:
+                            applied = points[level - 1]["fan_percent"] if level else None
+                            runtime["cooldown_since"] = None
+                            runtime["cooldown_remaining_seconds"] = None
+                    else:
+                        runtime["cooldown_since"] = None
+                else:
+                    # Missing sensor readings must never count toward cooling down.
+                    runtime["cooldown_since"] = None
+                runtime["applied_percent"] = applied
+
                 if applied is not None:
                     applied = max(
                         int(profile["minimum_percent"]),
@@ -363,6 +335,7 @@ class SentinelService:
                     should_write = runtime["supported"] and (
                         runtime.get("last_written_percent") != applied
                         or gpu_uuid not in self._fan_restored
+                        or runtime.get("error") is not None
                     )
                     if should_write:
                         try:
@@ -380,6 +353,7 @@ class SentinelService:
                 elif runtime["supported"] and (
                     runtime.get("last_written_percent") is not None
                     or gpu_uuid not in self._fan_restored
+                    or runtime.get("error") is not None
                 ):
                     try:
                         self.fan_controller.set_auto(gpu_uuid)
@@ -481,7 +455,10 @@ class SentinelService:
                 minimum_percent=request.minimum_percent,
                 maximum_percent=request.maximum_percent,
                 idle_temperature_celsius=request.idle_temperature_celsius,
-                idle_duration_seconds=request.idle_duration_seconds,
+                idle_duration_seconds=(
+                    request.cooldown_seconds if request.cooldown_seconds is not None
+                    else request.idle_duration_seconds
+                ),
                 curve_points=points,
                 expected_revision=request.expected_revision,
             )
@@ -501,11 +478,15 @@ class SentinelService:
 
             runtime = self._runtime_for_gpu(gpu_uuid)
             runtime["applied_percent"] = None
-            runtime["last_written_percent"] = None
+            runtime["cooldown_since"] = None
+            runtime["cooldown_remaining_seconds"] = None
+            # Preserve the last hardware write until the next successful update.
             if not points and runtime["supported"]:
                 try:
                     self.fan_controller.set_auto(gpu_uuid)
                     runtime["error"] = None
+                    runtime["last_written_percent"] = None
+                    self._fan_restored.add(gpu_uuid)
                 except FanControlError as exc:
                     runtime["error"] = str(exc)
                     raise HTTPException(status_code=503, detail=str(exc)) from exc
