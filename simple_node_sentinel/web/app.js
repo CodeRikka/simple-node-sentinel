@@ -404,7 +404,7 @@ function createFanControl(gpu) {
 
   const state = gpu.fan_control || {};
   const nodes = {
-    modeBadge, message, icon, actual, editButton,
+    control, modeBadge, message, icon, actual, editButton,
     preview: chart.svg, legendItem: chart.legendItem,
     pending: false, latest: gpu,
     profile: profileFromState(state),
@@ -420,6 +420,11 @@ function updateFanControl(gpu, overrideMessage = null) {
   const nodes = fanControls.get(gpu.uuid);
   if (!nodes) return;
   nodes.latest = gpu;
+  nodes.control.hidden = gpu.fan_percent == null;
+  if (nodes.control.hidden) {
+    if (openFanEditorUuid === gpu.uuid) closeFanEditor();
+    return;
+  }
   const state = gpu.fan_control || {};
   const supported = Boolean(state.supported);
   nodes.profile = profileFromState(state);
@@ -486,7 +491,7 @@ function closeFanEditor() {
 
 function openFanEditor(gpuUuid) {
   const nodes = fanControls.get(gpuUuid);
-  if (!nodes || nodes.pending) return;
+  if (!nodes || nodes.pending || nodes.control.hidden) return;
   const gpu = nodes.latest;
   const state = gpu.fan_control || {};
   if (!state.supported) return;
